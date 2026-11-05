@@ -197,6 +197,7 @@ class WebsocketTicker(PriceFeed):
         self._lock = threading.Lock()
         self._price: Decimal | None = None
         self._updated = 0.0
+        self._backoff = 1.0
         self._stop = threading.Event()
         self._ws: Any = None
         self._thread = threading.Thread(target=self._run, name="upbit-ticker", daemon=True)
@@ -229,7 +230,6 @@ class WebsocketTicker(PriceFeed):
             logger.error("websocket-client 가 없습니다. REST 현재가만 사용합니다.")
             return
 
-        backoff = 1.0
         while not self._stop.is_set():
             try:
                 app = websocket.WebSocketApp(
@@ -245,9 +245,9 @@ class WebsocketTicker(PriceFeed):
                 logger.exception("웹소켓 루프 오류")
             if self._stop.is_set():
                 break
-            logger.warning("현재가 웹소켓이 끊겼습니다. %.1f초 후 재연결합니다.", backoff)
-            self._stop.wait(backoff)
-            backoff = min(backoff * 2, 30)
+            logger.warning("현재가 웹소켓이 끊겼습니다. %.1f초 후 재연결합니다.", self._backoff)
+            self._stop.wait(self._backoff)
+            self._backoff = min(self._backoff * 2, 30)
 
     def _on_open(self, ws: Any) -> None:
         request = [
@@ -256,6 +256,7 @@ class WebsocketTicker(PriceFeed):
             {"format": "DEFAULT"},
         ]
         ws.send(json.dumps(request))
+        self._backoff = 1.0
         logger.info("현재가 웹소켓 연결: %s", self.market)
 
     def _on_message(self, _ws: Any, message: Any) -> None:
@@ -444,7 +445,13 @@ class UpbitREST:
                 "quotation",
                 auth=False,
             )
-            if not isinstance(body, list) or not body:
+            if not isinstance(body, list):
+                raise UpbitAPIError("캔들 응답 형식이 다릅니다.", retryable=True)
+            if not body:
+                # 페이지 커서가 상장 이전으로 내려가면 빈 목록이 정상입니다.
+                # 최신 봉 요청이 비면 일시 오류일 수 있어 재시도합니다.
+                if to:
+                    return []
                 raise UpbitAPIError("캔들이 비어 있습니다.", retryable=True)
             return [parse_upbit_candle(row) for row in body if isinstance(row, dict)]
 

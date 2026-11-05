@@ -303,7 +303,8 @@ class Strategy:
         return target
 
     def should_stop(self, trade_price: Decimal, stop: Decimal) -> bool:
-        return trade_price <= stop
+        # 손절가 0 은 '손절 없음'(평단 불명)입니다. 현재가 0 은 시세 오류로 보고 청산하지 않습니다.
+        return stop > 0 and trade_price > 0 and trade_price <= stop
 
 
 def net_pnl(

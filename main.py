@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
-from analyzer import analyze
+from analyzer import analyze, bars_are_stale, closed_bars
 from backfill import CandleStore, backfill_ohlcv
 from config import AppConfig, load_config
 from exchange_api import (
@@ -56,6 +56,7 @@ class Position:
     sold_fee: Decimal = Decimal("0")
     exit_attempts: int = 0
     estimated: bool = False
+    cost_known: bool = True
 
 
 class RoundTripBot:
@@ -84,6 +85,7 @@ class RoundTripBot:
         self._halt_logged = False
         self._started = time.monotonic()
         self._levels_monotonic = 0.0
+        self._once_key = ""
 
     def request_stop(self) -> None:
         self._stop = True
@@ -189,6 +191,7 @@ class RoundTripBot:
             )
             self.phase = "FLAT"
             return
+        self._restore_bookkeeping()
         logger.warning("실전 주문 모드입니다. 마켓 %s", self.cfg.market)
         self._reconcile()
 
@@ -223,12 +226,12 @@ class RoundTripBot:
         )
 
     def _step_flat(self, snapshot: MarketSnapshot) -> None:
-        if time.time() < self.cooldown_until:
-            return
         if self._loss_limit_hit():
             logger.error("당일 손실 한도에 도달해 신규 매수를 하지 않습니다.")
             self.phase = "HALT"
             self._save()
+            return
+        if time.time() < self.cooldown_until:
             return
         decision = self.strategy.plan_buy(snapshot, self.exchange.quote_available())
         if decision.plan is None:
@@ -244,11 +247,18 @@ class RoundTripBot:
                 to_plain_str(plan.notional),
             )
         spread = (snapshot.best_ask - snapshot.best_bid) / snapshot.best_bid
-        if spread > self.strategy.params.target_profit_rate:
+        if self.strategy.levels is not None:
+            edge = self.strategy.levels.grid_rate
+            edge_name = "그리드 간격"
+        else:
+            edge = self.strategy.params.target_profit_rate
+            edge_name = "목표 순수익률"
+        if spread > edge:
             logger.warning(
-                "스프레드 %s%% 가 목표 순수익률 %s%% 보다 큽니다.",
+                "스프레드 %s%% 가 %s %s%% 보다 큽니다.",
                 f"{spread * 100:.4f}",
-                f"{self.strategy.params.target_profit_rate * 100:.4f}",
+                edge_name,
+                f"{float(edge * 100):.4f}",
             )
         try:
             order = self._submit_buy(plan.price, plan.volume)
@@ -347,6 +357,12 @@ class RoundTripBot:
         if not order.is_open:
             if order.executed_volume > 0:
                 self._account_sell(order)
+            if self._unknown_coin_left():
+                logger.error("원가를 모르는 코인이 남아 자동 청산하지 않습니다. 거래소에서 직접 확인하세요.")
+                self.order_uuid = None
+                self.phase = "HALT"
+                self._save()
+                return
             self._finish_exit(snapshot, "지정가 매도")
             return
         if self.position and self.strategy.should_stop(snapshot.trade_price, self.position.stop_price):
@@ -354,13 +370,18 @@ class RoundTripBot:
             return
         if order.price is None or self.position is None:
             return
+        if not self.position.cost_known:
+            return
+        if self.position.buy_price <= 0:
+            return
         if not self._sell_reprice_due():
             return
         min_sell = self.strategy.min_sell_price(self.position.buy_price)
         self.position.min_sell_price = min_sell
         new_price = self.strategy.next_sell_price(order.price, snapshot.best_ask, min_sell)
         if new_price is None:
-            logger.info(
+            self._log_once(
+                f"sell-hold:{order.uuid}:{order.price}:{min_sell}",
                 "최소 매도가 %s 아래로는 내리지 않아 매도 주문 %s 를 유지합니다.",
                 to_plain_str(min_sell),
                 to_plain_str(order.price),
@@ -384,6 +405,12 @@ class RoundTripBot:
         self.position.min_sell_price = min_sell
         self._track(replaced)
         logger.info("매도 재호가 | price=%s | 하한 %s", to_plain_str(new_price), to_plain_str(min_sell))
+
+    def _unknown_coin_left(self) -> bool:
+        if self.position is None or self.position.cost_known:
+            return False
+        self.exchange.begin_step()
+        return self.exchange.base_total() > 0
 
     def _execute_stop(self, snapshot: MarketSnapshot) -> None:
         if self.position is None:
@@ -543,12 +570,21 @@ class RoundTripBot:
             return
         saved = self._read_state()
         saved_pos = (saved or {}).get("position") if saved else None
+        if saved_pos and saved_pos.get("cost_known") is False:
+            logger.error("원가를 모르는 잔고라 새 매도를 넣지 않습니다. 거래소에서 직접 확인하세요.")
+            self.phase = "HALT"
+            self._save()
+            return
         if saved_pos and saved_pos.get("buy_price"):
-            buy_price = Decimal(saved_pos["buy_price"])
-            notional = Decimal(saved_pos["buy_notional"])
-            fee = Decimal(saved_pos["buy_fee"])
-            estimated = bool(saved_pos.get("estimated", False))
-            volume = Decimal(saved_pos.get("volume") or str(total))
+            volume = self._decimal_field(saved_pos, "volume", str(total))
+            if volume <= 0:
+                volume = total
+            self.position = self._position_from_saved(saved_pos, volume)
+            if self.position is None:
+                logger.error("상태 파일의 매수 단가를 읽지 못했습니다. 자동 매도를 넣지 않습니다.")
+                self.phase = "HALT"
+                self._save()
+                return
         else:
             buy_price = self.exchange.base_avg_buy_price()
             if buy_price <= 0:
@@ -556,21 +592,20 @@ class RoundTripBot:
                 self.phase = "HALT"
                 self._save()
                 return
-            volume = total
-            notional = buy_price * volume
+            notional = buy_price * total
             fee = notional * self.strategy.params.buy_fee_rate
-            estimated = True
             logger.warning("상태 파일이 없어 거래소 평단 %s 으로 매도 기준을 잡습니다. 손익은 추정치입니다.", to_plain_str(buy_price))
-        self.position = Position(
-            cycle_id=(saved_pos or {}).get("cycle_id") or uuid.uuid4().hex[:12],
-            buy_price=buy_price,
-            volume=volume,
-            buy_notional=notional,
-            buy_fee=fee,
-            stop_price=self.strategy.stop_price(buy_price),
-            min_sell_price=self.strategy.min_sell_price(buy_price),
-            estimated=estimated,
-        )
+            self.position = Position(
+                cycle_id=uuid.uuid4().hex[:12],
+                buy_price=buy_price,
+                volume=total,
+                buy_notional=notional,
+                buy_fee=fee,
+                stop_price=self.strategy.stop_price(buy_price),
+                min_sell_price=self.strategy.min_sell_price(buy_price),
+                estimated=True,
+                cost_known=True,
+            )
         self.order_uuid = None
         self.phase = "HOLDING"
         self._save()
@@ -604,46 +639,59 @@ class RoundTripBot:
         saved = self._read_state()
         saved_pos = (saved or {}).get("position") if saved else None
         if saved_pos and saved_pos.get("buy_price"):
-            buy_price = Decimal(saved_pos["buy_price"])
-            notional = Decimal(saved_pos["buy_notional"])
-            fee = Decimal(saved_pos["buy_fee"])
-            estimated = bool(saved_pos.get("estimated", False))
-            volume = Decimal(saved_pos.get("volume") or str(order.volume))
+            volume = self._decimal_field(saved_pos, "volume", str(order.volume))
+            if volume <= 0:
+                volume = order.volume
+            position = self._position_from_saved(saved_pos, volume)
         else:
+            position = None
+        if position is None:
             buy_price = self.exchange.base_avg_buy_price()
             volume = order.volume
-            estimated = True
             if buy_price <= 0:
+                if order.price is None or order.price <= 0:
+                    logger.error("평단과 주문 가격을 모두 알 수 없어 매도 주문을 관리하지 않습니다. uuid=%s", order.uuid)
+                    self.phase = "HALT"
+                    self._save()
+                    return
                 logger.error(
-                    "평단을 알 수 없습니다. 매도 주문 %s 은 유지하고 손절과 가격 인하는 하지 않습니다.",
+                    "평단을 알 수 없습니다. 매도 주문 %s 은 유지하고 손절과 가격 변경은 하지 않습니다.",
                     order.uuid,
                 )
-                buy_price = order.price or Decimal("0")
-                notional = buy_price * volume
-                fee = Decimal("0")
-                minimum = order.price or Decimal("0")
-                stop = Decimal("0")
+                position = Position(
+                    cycle_id=uuid.uuid4().hex[:12],
+                    buy_price=order.price,
+                    volume=volume,
+                    buy_notional=order.price * volume,
+                    buy_fee=Decimal("0"),
+                    stop_price=Decimal("0"),
+                    min_sell_price=order.price,
+                    estimated=True,
+                    cost_known=False,
+                )
             else:
                 notional = buy_price * volume
-                fee = notional * self.strategy.params.buy_fee_rate
-                minimum = self.strategy.min_sell_price(buy_price)
-                stop = self.strategy.stop_price(buy_price)
-        if saved_pos and saved_pos.get("buy_price"):
-            minimum = self.strategy.min_sell_price(buy_price)
-            stop = self.strategy.stop_price(buy_price)
-        self.position = Position(
-            cycle_id=(saved_pos or {}).get("cycle_id") or uuid.uuid4().hex[:12],
-            buy_price=buy_price,
-            volume=volume,
-            buy_notional=notional,
-            buy_fee=fee,
-            stop_price=stop,
-            min_sell_price=minimum,
-            estimated=estimated,
-        )
+                position = Position(
+                    cycle_id=uuid.uuid4().hex[:12],
+                    buy_price=buy_price,
+                    volume=volume,
+                    buy_notional=notional,
+                    buy_fee=notional * self.strategy.params.buy_fee_rate,
+                    stop_price=self.strategy.stop_price(buy_price),
+                    min_sell_price=self.strategy.min_sell_price(buy_price),
+                    estimated=True,
+                    cost_known=True,
+                )
+                logger.warning("상태 파일이 없어 거래소 평단 %s 으로 매도 기준을 잡습니다. 손익은 추정치입니다.", to_plain_str(buy_price))
+        self.position = position
         self.phase = "SELL_WAIT"
         self._track(order)
-        logger.info("미체결 매도 주문을 이어받습니다. uuid=%s price=%s", order.uuid, to_plain_str(order.price or Decimal("0")))
+        logger.info(
+            "미체결 매도 주문을 이어받습니다. uuid=%s price=%s | 원가 %s",
+            order.uuid,
+            to_plain_str(order.price or Decimal("0")),
+            "확인" if position.cost_known else "불명",
+        )
 
     def _submit_buy(self, price: Decimal, volume: Decimal) -> Order:
         current = volume
@@ -672,16 +720,20 @@ class RoundTripBot:
         if order.is_open or order.executed_volume <= 0:
             return
         self._seen_sells.add(order.uuid)
+        fee = order.paid_fee
+        if fee <= 0 and order.funds > 0:
+            fee = order.funds * self.strategy.params.sell_fee_rate
+            logger.info("매도 수수료 필드가 비어 설정값으로 추정합니다: %s", to_plain_str(fee))
         self.position.sold_volume += order.executed_volume
         self.position.sold_funds += order.funds
-        self.position.sold_fee += order.paid_fee
+        self.position.sold_fee += fee
         logger.info(
             "매도 체결 | uuid=%s price=%s volume=%s 금액=%s 수수료=%s",
             order.uuid,
             to_plain_str(order.price or order.vwap()),
             to_plain_str(order.executed_volume),
             to_plain_str(order.funds),
-            to_plain_str(order.paid_fee),
+            to_plain_str(fee),
         )
 
     def _log_pnl(self, reason: str) -> None:
@@ -800,8 +852,22 @@ class RoundTripBot:
             result.new_rows,
             result.stored_rows,
         )
+        now_ms = int(time.time() * 1000)
+        if bars_are_stale(bars, self.cfg.backfill_unit, now_ms):
+            logger.warning(
+                "최근 캔들이 없어 동적 단가를 갱신하지 않습니다. 저장된 최신 봉 %s",
+                bars[-1].open_time if bars else "없음",
+            )
+            if self.strategy.levels is None:
+                logger.warning("아직 동적 단가가 없어 고정 퍼센트를 유지합니다.")
+            return
+        period_ms = self.cfg.backfill_unit * 60_000
+        usable = closed_bars(bars, period_ms, now_ms)
+        if len(usable) < self.cfg.atr_period:
+            logger.info("마감된 캔들이 %s개뿐이라 진행 중인 봉을 포함해 분석합니다.", len(usable))
+            usable = list(bars)
         levels = analyze(
-            bars,
+            usable,
             buy_fee_rate=self.strategy.params.buy_fee_rate,
             sell_fee_rate=self.strategy.params.sell_fee_rate,
             atr_period=self.cfg.atr_period,
@@ -831,14 +897,35 @@ class RoundTripBot:
                 float(self.strategy.levels.grid_rate * 100),
                 float(self.strategy.levels.round_trip_fee_rate * 100),
             )
-            return
-        logger.info(
-            "백필 단가가 없어 고정 목표를 사용합니다. 매수가 100 이면 최소 매도가 %s "
-            "(왕복 수수료 %.2f%% + 목표 순수익 %.2f%% 이상).",
-            to_plain_str(sample),
-            float((self.strategy.params.buy_fee_rate + self.strategy.params.sell_fee_rate) * 100),
-            float(self.strategy.params.target_profit_rate * 100),
-        )
+        else:
+            logger.info(
+                "백필 단가가 없어 고정 목표를 사용합니다. 매수가 100 이면 최소 매도가 %s "
+                "(왕복 수수료 %.2f%% + 목표 순수익 %.2f%% 이상).",
+                to_plain_str(sample),
+                float((self.strategy.params.buy_fee_rate + self.strategy.params.sell_fee_rate) * 100),
+                float(self.strategy.params.target_profit_rate * 100),
+            )
+        self._warn_stop_width()
+
+    def _warn_stop_width(self) -> None:
+        stop = self.strategy.params.stop_loss_rate
+        if self.strategy.levels is not None:
+            width = self.strategy.levels.grid_rate
+            label = "그리드"
+        else:
+            width = (
+                self.strategy.params.target_profit_rate
+                + self.strategy.params.buy_fee_rate
+                + self.strategy.params.sell_fee_rate
+            )
+            label = "수수료와 목표 수익"
+        if stop <= width:
+            logger.warning(
+                "손절 %.3f%% 가 %s %.3f%% 이하입니다. 익절 전에 손절이 먼저 날 수 있습니다.",
+                float(stop * 100),
+                label,
+                float(width * 100),
+            )
 
     def _reserved_quote(self, order: Order) -> Decimal:
         if order.side != "bid":
@@ -885,6 +972,12 @@ class RoundTripBot:
             self._last_skip = reason
             self._last_skip_at = now
 
+    def _log_once(self, key: str, message: str, *args: object) -> None:
+        if key == self._once_key:
+            return
+        self._once_key = key
+        logger.info(message, *args)
+
     def _log_health(self, snapshot: MarketSnapshot) -> None:
         try:
             quote = self.exchange.quote_available()
@@ -892,16 +985,22 @@ class RoundTripBot:
         except Exception:
             logger.exception("상태 로그용 잔고 조회 실패")
             return
+        if self.strategy.levels is None:
+            grid_text = "고정"
+        else:
+            grid_text = f"{float(self.strategy.levels.grid_rate * 100):.3f}%"
         logger.info(
-            "상태 %s | 현재가 %s | 박스 %s~%s | %s %s | %s %s | 완료 사이클 %s",
+            "상태 %s | 현재가 %s | 박스 %s~%s | 그리드 %s | %s %s | %s %s | 당일손익 %s | 완료 %s",
             self.phase,
             to_plain_str(snapshot.trade_price),
             to_plain_str(snapshot.box_low),
             to_plain_str(snapshot.box_high),
+            grid_text,
             self.cfg.quote,
             to_plain_str(quote),
             self.cfg.base,
             to_plain_str(base),
+            to_plain_str(self.realized),
             self.completed_cycles,
         )
 
@@ -930,12 +1029,17 @@ class RoundTripBot:
                 "sold_funds": to_plain_str(self.position.sold_funds),
                 "sold_fee": to_plain_str(self.position.sold_fee),
                 "estimated": self.position.estimated,
+                "cost_known": self.position.cost_known,
             }
         payload = {
             "phase": self.phase,
             "market": self.cfg.market,
             "order_uuid": self.order_uuid,
             "position": position,
+            "realized": to_plain_str(self.realized),
+            "pnl_date": self._pnl_date.isoformat(),
+            "completed_cycles": self.completed_cycles,
+            "cooldown_until": self.cooldown_until,
         }
         path = Path(self.cfg.state_file)
         temporary = path.with_suffix(path.suffix + ".tmp")
@@ -955,6 +1059,79 @@ class RoundTripBot:
             logger.warning("상태 파일 마켓이 달라 무시합니다: %s", data.get("market"))
             return None
         return data
+
+    def _restore_bookkeeping(self) -> None:
+        """실전 재시작 시 당일 손실과 손절 쿨다운을 이어받습니다. 모의거래는 호출하지 않습니다."""
+        saved = self._read_state()
+        if not saved:
+            return
+        today = datetime.now(timezone.utc).date()
+        self._pnl_date = today
+        if saved.get("pnl_date") == today.isoformat():
+            self.realized = self._decimal_field(saved, "realized")
+        else:
+            self.realized = Decimal("0")
+        try:
+            self.completed_cycles = int(saved.get("completed_cycles") or 0)
+        except (TypeError, ValueError):
+            self.completed_cycles = 0
+        try:
+            cooldown = float(saved.get("cooldown_until") or 0)
+        except (TypeError, ValueError):
+            cooldown = 0.0
+        if cooldown > time.time():
+            self.cooldown_until = cooldown
+        remain = max(0.0, self.cooldown_until - time.time())
+        logger.info(
+            "상태 복구 | 당일 실현손익 %s %s | 완료 사이클 %s | 남은 쿨다운 %.0f초",
+            to_plain_str(self.realized),
+            self.cfg.quote,
+            self.completed_cycles,
+            remain,
+        )
+
+    def _position_from_saved(self, saved_pos: dict, volume: Decimal) -> Position | None:
+        buy_price = self._decimal_field(saved_pos, "buy_price")
+        if buy_price <= 0:
+            return None
+        cost_known = bool(saved_pos.get("cost_known", True))
+        if cost_known:
+            try:
+                minimum = self.strategy.min_sell_price(buy_price)
+                stop = self.strategy.stop_price(buy_price)
+            except ValueError:
+                logger.exception("저장된 매수가로 손절가와 최소 매도가를 계산하지 못했습니다.")
+                return None
+        else:
+            minimum = self._decimal_field(saved_pos, "min_sell_price")
+            stop = self._decimal_field(saved_pos, "stop_price")
+        notional = self._decimal_field(saved_pos, "buy_notional")
+        if notional <= 0:
+            notional = buy_price * volume
+        return Position(
+            cycle_id=str(saved_pos.get("cycle_id") or uuid.uuid4().hex[:12]),
+            buy_price=buy_price,
+            volume=volume,
+            buy_notional=notional,
+            buy_fee=self._decimal_field(saved_pos, "buy_fee"),
+            stop_price=stop,
+            min_sell_price=minimum,
+            sold_volume=self._decimal_field(saved_pos, "sold_volume"),
+            sold_funds=self._decimal_field(saved_pos, "sold_funds"),
+            sold_fee=self._decimal_field(saved_pos, "sold_fee"),
+            estimated=bool(saved_pos.get("estimated", False)),
+            cost_known=cost_known,
+        )
+
+    @staticmethod
+    def _decimal_field(data: dict, key: str, default: str = "0") -> Decimal:
+        raw = data.get(key)
+        if raw in (None, ""):
+            raw = default
+        try:
+            return Decimal(str(raw))
+        except Exception:
+            return Decimal(default)
 
     def _sleep(self, seconds: float) -> None:
         deadline = time.monotonic() + seconds

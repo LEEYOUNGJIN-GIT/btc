@@ -109,6 +109,23 @@ class BackfillTests(unittest.TestCase):
             self.assertEqual(slept, [0.25, 0.5])
             store.close()
 
+    def test_empty_page_stops_without_error(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            store = CandleStore(str(Path(folder) / "ohlcv.sqlite"))
+            result = backfill_ohlcv(
+                lambda *_args: [],
+                store,
+                "USDT-BTC",
+                1,
+                hours=1,
+                now_ms=5_000_000,
+                page_sleep=0,
+                sleep=lambda _seconds: None,
+            )
+            self.assertEqual(result.pages, 0)
+            self.assertEqual(result.stored_rows, 0)
+            store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

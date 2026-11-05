@@ -1,7 +1,7 @@
 import unittest
 from decimal import Decimal
 
-from analyzer import analyze, breakeven_sell
+from analyzer import analyze, bars_are_stale, breakeven_sell, closed_bars
 from backfill import OhlcvBar
 
 
@@ -58,6 +58,17 @@ class AnalyzerTests(unittest.TestCase):
         )
         self.assertEqual(levels.support, Decimal("1"))
         self.assertEqual(levels.resistance, Decimal("20"))
+
+    def test_forming_bar_is_dropped_and_quiet_gap_is_not_stale(self) -> None:
+        now = 1_000_000_000_000
+        fresh = bar(0, "99", "101", "100")
+        fresh = OhlcvBar(now - 30_000, fresh.open_time, fresh.open, fresh.high, fresh.low, fresh.close, fresh.volume)
+        closed = OhlcvBar(now - 90_000, "closed", Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"))
+        self.assertEqual(closed_bars([closed, fresh], 60_000, now), [closed])
+        self.assertFalse(bars_are_stale([fresh], 1, now))
+        old = OhlcvBar(now - 3_600_000, "old", Decimal("100"), Decimal("101"), Decimal("99"), Decimal("100"), Decimal("1"))
+        self.assertTrue(bars_are_stale([old], 1, now))
+        self.assertFalse(bars_are_stale([old], 240, now))
 
     def test_breakeven_is_above_raw_fee_sum(self) -> None:
         sell = breakeven_sell(Decimal("100"), Decimal("0.0005"), Decimal("0.0005"))

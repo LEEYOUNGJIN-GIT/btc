@@ -49,7 +49,7 @@ class CandleStore:
         if target.parent and str(target.parent) not in {"", "."}:
             target.parent.mkdir(parents=True, exist_ok=True)
         self.path = str(target)
-        self._conn = sqlite3.connect(self.path)
+        self._conn = sqlite3.connect(self.path, timeout=10)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute(
             """
@@ -233,7 +233,8 @@ def backfill_ohlcv(
             logger.warning("백필 페이지가 더 과거로 내려가지 않아 중단합니다. oldest=%s", oldest)
             break
         seen_oldest = oldest
-        new_rows += store.upsert(market, unit, ordered)
+        added = store.upsert(market, unit, ordered)
+        new_rows += added
         pages += 1
         logger.info(
             "백필 페이지 %s | %s %s분 | %s ~ %s | 신규 %s",
@@ -242,7 +243,7 @@ def backfill_ohlcv(
             unit,
             ordered[0].open_time,
             ordered[-1].open_time,
-            new_rows,
+            added,
         )
         if oldest <= start_ms:
             break

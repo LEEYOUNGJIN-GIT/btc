@@ -72,6 +72,8 @@ class BreakEvenTests(unittest.TestCase):
         self.assertLessEqual(stop, Decimal("100") * Decimal("0.995"))
         self.assertTrue(self.strategy.should_stop(stop, stop))
         self.assertFalse(self.strategy.should_stop(stop + Decimal("0.01"), stop))
+        self.assertFalse(self.strategy.should_stop(Decimal("0"), stop))
+        self.assertFalse(self.strategy.should_stop(Decimal("50"), Decimal("0")))
 
     def test_reprice_never_undercuts_minimum(self) -> None:
         minimum = self.strategy.min_sell_price(Decimal("100"))

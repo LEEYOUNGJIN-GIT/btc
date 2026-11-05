@@ -154,6 +154,25 @@ def _atr(bars: Sequence[OhlcvBar], period: int) -> Decimal:
     return sum(window, Decimal("0")) / Decimal(len(window))
 
 
+def closed_bars(bars: Sequence[OhlcvBar], period_ms: int, now_ms: int) -> list[OhlcvBar]:
+    """마감된 봉만 남깁니다. 진행 중 봉은 고저가 아직 열려 ATR을 작게 만듭니다."""
+    if period_ms <= 0:
+        return list(bars)
+    return [bar for bar in bars if bar.timestamp_ms + period_ms <= now_ms]
+
+
+def bars_are_stale(bars: Sequence[OhlcvBar], unit_minutes: int, now_ms: int) -> bool:
+    """최신 봉의 시작 시각이 한 주기보다 10분 이상 더 오래되면 시세가 끊긴 것입니다.
+
+    봉 시각은 시작 시각이라, 진행 중인 60분봉은 정상적으로도 수십 분 전 시각을 갖습니다.
+    """
+    if not bars or unit_minutes <= 0:
+        return True
+    newest = max(bar.timestamp_ms for bar in bars)
+    allowance = unit_minutes * 60_000 + 10 * 60_000
+    return now_ms - newest > allowance
+
+
 def _percentile(values: Sequence[Decimal], quantile: Decimal) -> Decimal:
     if not values:
         raise ValueError("백분위 계산에 값이 없습니다.")
