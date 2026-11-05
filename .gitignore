@@ -1,0 +1,10 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+trading.log
+trading.log.*
+position_state.json
+*.tmp
