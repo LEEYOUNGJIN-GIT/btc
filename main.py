@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
+from analyzer import analyze
+from backfill import CandleStore, backfill_ohlcv
 from config import AppConfig, load_config
 from exchange_api import (
     NullFeed,
@@ -81,6 +83,7 @@ class RoundTripBot:
         self._steps = 0
         self._halt_logged = False
         self._started = time.monotonic()
+        self._levels_monotonic = 0.0
 
     def request_stop(self) -> None:
         self._stop = True
@@ -104,6 +107,7 @@ class RoundTripBot:
         self.shutdown()
 
     def step(self) -> None:
+        self._maybe_refresh_levels()
         self.exchange.begin_step()
         self._roll_daily()
         snapshot = self._snapshot()
@@ -172,13 +176,8 @@ class RoundTripBot:
                 self.strategy.params = updated
                 self.cfg.buy_fee_rate = bid
                 self.cfg.sell_fee_rate = ask
-        sample = self.strategy.min_sell_price(Decimal("100"))
-        logger.info(
-            "매수가 100 이면 최소 매도가 %s (왕복 수수료 %.2f%% + 목표 순수익 %.2f%% 이상).",
-            to_plain_str(sample),
-            float((self.strategy.params.buy_fee_rate + self.strategy.params.sell_fee_rate) * 100),
-            float(self.strategy.params.target_profit_rate * 100),
-        )
+        self._maybe_refresh_levels(force=True)
+        self._log_pricing()
         logger.warning("손절은 이 프로세스가 켜져 있을 때만 동작합니다. 숏 주문은 넣지 않습니다.")
         if self.cfg.balance_use_ratio == 1:
             logger.warning("주문 가능 USDT 를 매수에 사용합니다. 첫 실전은 BALANCE_USE_RATIO 를 낮추세요.")
@@ -208,7 +207,11 @@ class RoundTripBot:
             price = self.exchange.get_ticker(self.cfg.market).trade_price
         self._last_price = price
         self.exchange.notify_trade_price(price)
-        box_low, box_high = box_from_candles(self._candles)
+        levels = self.strategy.levels
+        if levels is not None and levels.resistance > levels.support:
+            box_low, box_high = levels.support, levels.resistance
+        else:
+            box_low, box_high = box_from_candles(self._candles)
         return MarketSnapshot(
             trade_price=price,
             best_bid=book.best_bid,
@@ -291,7 +294,7 @@ class RoundTripBot:
             self._cancel_tracked()
             self._adopt_naked_base()
             return
-        if not self._buy_timed_out():
+        if not self._buy_timed_out() and not self._dynamic_buy_moved(order, snapshot):
             return
         if order.executed_volume > 0:
             logger.info("부분 체결된 매수를 취소하고 체결분만큼 매도합니다.")
@@ -349,11 +352,12 @@ class RoundTripBot:
         if self.position and self.strategy.should_stop(snapshot.trade_price, self.position.stop_price):
             self._execute_stop(snapshot)
             return
-        if time.time() - self.order_placed_at < self.cfg.sell_reprice_sec:
-            return
         if order.price is None or self.position is None:
             return
-        min_sell = max(self.position.min_sell_price, self.strategy.min_sell_price(self.position.buy_price))
+        if not self._sell_reprice_due():
+            return
+        min_sell = self.strategy.min_sell_price(self.position.buy_price)
+        self.position.min_sell_price = min_sell
         new_price = self.strategy.next_sell_price(order.price, snapshot.best_ask, min_sell)
         if new_price is None:
             logger.info(
@@ -739,6 +743,102 @@ class RoundTripBot:
 
     def _buy_timed_out(self) -> bool:
         return time.time() - self.order_placed_at >= self.cfg.buy_timeout_sec
+
+    def _dynamic_buy_moved(self, order: Order, snapshot: MarketSnapshot) -> bool:
+        if self.strategy.levels is None or order.price is None:
+            return False
+        if time.time() - self.order_placed_at < self.cfg.dynamic_reprice_sec:
+            return False
+        power = self.exchange.quote_available() + self._reserved_quote(order)
+        decision = self.strategy.plan_buy(snapshot, power)
+        return decision.plan is not None and decision.plan.price != order.price
+
+    def _sell_reprice_due(self) -> bool:
+        age = time.time() - self.order_placed_at
+        if age >= self.cfg.sell_reprice_sec:
+            return True
+        return self.strategy.levels is not None and age >= self.cfg.dynamic_reprice_sec
+
+    def _maybe_refresh_levels(self, force: bool = False) -> None:
+        if not self.cfg.backfill_enabled:
+            return
+        now = time.monotonic()
+        if not force and now - self._levels_monotonic < self.cfg.analyze_refresh_sec:
+            return
+        try:
+            self._refresh_dynamic_levels()
+        except Exception:
+            logger.exception("동적 단가 갱신 실패. 마지막 산출값 또는 고정 간격을 유지합니다.")
+        finally:
+            self._levels_monotonic = now
+
+    def _refresh_dynamic_levels(self) -> None:
+        start_ms = int(time.time() * 1000) - self.cfg.backfill_hours * 3_600_000
+        with CandleStore(self.cfg.backfill_db) as store:
+            result = backfill_ohlcv(
+                self.exchange.get_ohlcv_page,
+                store,
+                self.cfg.market,
+                self.cfg.backfill_unit,
+                self.cfg.backfill_hours,
+                page_sleep=self.cfg.backfill_page_sleep,
+                max_retries=self.cfg.max_retries,
+                retry_delay=self.cfg.retry_delay_sec,
+            )
+            bars = store.load(self.cfg.market, self.cfg.backfill_unit, start_ms)
+            if self.cfg.backfill_csv:
+                written = store.export_csv(
+                    self.cfg.market,
+                    self.cfg.backfill_unit,
+                    self.cfg.backfill_csv,
+                    start_ms,
+                )
+                logger.info("백필 CSV %s행 저장: %s", written, self.cfg.backfill_csv)
+        logger.info(
+            "백필 완료 | 페이지 %s | 신규 %s | 저장 %s",
+            result.pages,
+            result.new_rows,
+            result.stored_rows,
+        )
+        levels = analyze(
+            bars,
+            buy_fee_rate=self.strategy.params.buy_fee_rate,
+            sell_fee_rate=self.strategy.params.sell_fee_rate,
+            atr_period=self.cfg.atr_period,
+            range_lookback=self.cfg.range_lookback,
+            min_grid_rate=self.cfg.min_grid_rate,
+            max_grid_rate=self.cfg.max_grid_rate,
+            support_percentile=self.cfg.support_percentile,
+            resistance_percentile=self.cfg.resistance_percentile,
+        )
+        self.strategy.update_levels(levels)
+        logger.info(
+            "동적 단가 | 그리드 %.3f%% | ATR %.3f%% | 평균 고저폭 %.3f%% | 박스 %s~%s | 표본 %s",
+            float(levels.grid_rate * 100),
+            float(levels.atr_rate * 100),
+            float(levels.mean_range_rate * 100),
+            to_plain_str(levels.support),
+            to_plain_str(levels.resistance),
+            levels.sample_size,
+        )
+
+    def _log_pricing(self) -> None:
+        sample = self.strategy.min_sell_price(Decimal("100"))
+        if self.strategy.levels is not None:
+            logger.info(
+                "매수가 100 이면 동적 최소 매도가 %s (그리드 %.3f%%, 왕복 수수료 %.2f%% 이상).",
+                to_plain_str(sample),
+                float(self.strategy.levels.grid_rate * 100),
+                float(self.strategy.levels.round_trip_fee_rate * 100),
+            )
+            return
+        logger.info(
+            "백필 단가가 없어 고정 목표를 사용합니다. 매수가 100 이면 최소 매도가 %s "
+            "(왕복 수수료 %.2f%% + 목표 순수익 %.2f%% 이상).",
+            to_plain_str(sample),
+            float((self.strategy.params.buy_fee_rate + self.strategy.params.sell_fee_rate) * 100),
+            float(self.strategy.params.target_profit_rate * 100),
+        )
 
     def _reserved_quote(self, order: Order) -> Decimal:
         if order.side != "bid":

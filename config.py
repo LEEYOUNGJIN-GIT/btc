@@ -87,6 +87,20 @@ class AppConfig:
     quotation_rps: float = 8.0
     account_rps: float = 15.0
     order_rps: float = 6.0
+    backfill_enabled: bool = True
+    backfill_hours: int = 24
+    backfill_unit: int = 1
+    backfill_db: str = "data/ohlcv.sqlite"
+    backfill_csv: str = ""
+    backfill_page_sleep: float = 0.15
+    atr_period: int = 14
+    range_lookback: int = 120
+    min_grid_rate: Decimal = Decimal("0.002")
+    max_grid_rate: Decimal = Decimal("0.004")
+    support_percentile: Decimal = Decimal("0.10")
+    resistance_percentile: Decimal = Decimal("0.90")
+    analyze_refresh_sec: float = 60
+    dynamic_reprice_sec: float = 15
 
     @property
     def quote(self) -> str:
@@ -129,6 +143,20 @@ class AppConfig:
             raise ValueError("MAX_RETRIES 는 1 이상이어야 합니다.")
         if self.loop_interval_sec <= 0:
             raise ValueError("LOOP_INTERVAL_SEC 는 0보다 커야 합니다.")
+        if not 1 <= self.backfill_hours <= 24 * 14:
+            raise ValueError("BACKFILL_HOURS 는 1~336 입니다.")
+        if self.backfill_unit not in {1, 3, 5, 10, 15, 30, 60, 240}:
+            raise ValueError("BACKFILL_UNIT 이 업비트 분봉 단위가 아닙니다.")
+        if self.atr_period < 2 or self.range_lookback < self.atr_period:
+            raise ValueError("RANGE_LOOKBACK 은 ATR_PERIOD 이상이어야 합니다.")
+        if not Decimal("0") < self.min_grid_rate < self.max_grid_rate < 1:
+            raise ValueError("MIN_GRID_RATE 와 MAX_GRID_RATE 범위를 확인하세요.")
+        if not Decimal("0") <= self.support_percentile < self.resistance_percentile <= 1:
+            raise ValueError("지지/저항 백분위가 올바르지 않습니다.")
+        if self.analyze_refresh_sec <= 0 or self.dynamic_reprice_sec < 0:
+            raise ValueError("분석 갱신 주기가 올바르지 않습니다.")
+        if self.backfill_page_sleep < 0:
+            raise ValueError("BACKFILL_PAGE_SLEEP 는 0 이상이어야 합니다.")
         StrategyParams(
             buy_fee_rate=self.buy_fee_rate,
             sell_fee_rate=self.sell_fee_rate,
@@ -193,6 +221,20 @@ def load_config() -> AppConfig:
         log_file=_text("LOG_FILE", "trading.log"),
         log_level=_text("LOG_LEVEL", "INFO").upper(),
         state_file=_text("STATE_FILE", "position_state.json"),
+        backfill_enabled=_bool("BACKFILL_ENABLED", True),
+        backfill_hours=_int("BACKFILL_HOURS", 24),
+        backfill_unit=_int("BACKFILL_UNIT", 1),
+        backfill_db=_text("BACKFILL_DB", "data/ohlcv.sqlite"),
+        backfill_csv=_text("BACKFILL_CSV", ""),
+        backfill_page_sleep=float(_text("BACKFILL_PAGE_SLEEP", "0.15")),
+        atr_period=_int("ATR_PERIOD", 14),
+        range_lookback=_int("RANGE_LOOKBACK", 120),
+        min_grid_rate=_decimal("MIN_GRID_RATE", "0.002"),
+        max_grid_rate=_decimal("MAX_GRID_RATE", "0.004"),
+        support_percentile=_decimal("SUPPORT_PERCENTILE", "0.10"),
+        resistance_percentile=_decimal("RESISTANCE_PERCENTILE", "0.90"),
+        analyze_refresh_sec=float(_text("ANALYZE_REFRESH_SEC", "60")),
+        dynamic_reprice_sec=float(_text("DYNAMIC_REPRICE_SEC", "15")),
     )
     config.validate()
     return config

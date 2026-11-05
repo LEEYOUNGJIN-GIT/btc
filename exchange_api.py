@@ -22,6 +22,7 @@ from urllib.parse import unquote, urlencode
 import jwt
 import requests
 
+from backfill import OhlcvBar, parse_upbit_candle
 from logger import get_logger
 from strategy import Candle, align_price, to_plain_str
 
@@ -422,30 +423,36 @@ class UpbitREST:
 
         return self._retry("호가 조회", call)
 
-    def get_candles(self, market: str, unit: int, count: int) -> list[Candle]:
-        def call() -> list[Candle]:
+    def get_ohlcv_page(
+        self,
+        market: str,
+        unit: int,
+        count: int = 200,
+        to: str | None = None,
+    ) -> list[OhlcvBar]:
+        """분봉 한 페이지. to 는 그 시각보다 과거 캔들만 받는 업비트 커서입니다."""
+        safe_count = max(1, min(int(count), 200))
+
+        def call() -> list[OhlcvBar]:
+            params = {"market": market, "count": str(safe_count)}
+            if to:
+                params["to"] = to
             body = self._request(
                 "GET",
                 f"/v1/candles/minutes/{unit}",
-                {"market": market, "count": str(count)},
+                params,
                 "quotation",
                 auth=False,
             )
-            candles: list[Candle] = []
-            for row in body:
-                candles.append(
-                    Candle(
-                        open=_dec(row["opening_price"]),
-                        high=_dec(row["high_price"]),
-                        low=_dec(row["low_price"]),
-                        close=_dec(row["trade_price"]),
-                    )
-                )
-            if not candles:
+            if not isinstance(body, list) or not body:
                 raise UpbitAPIError("캔들이 비어 있습니다.", retryable=True)
-            return candles
+            return [parse_upbit_candle(row) for row in body if isinstance(row, dict)]
 
         return self._retry("캔들 조회", call)
+
+    def get_candles(self, market: str, unit: int, count: int) -> list[Candle]:
+        bars = self.get_ohlcv_page(market, unit, count)
+        return [Candle(open=bar.open, high=bar.high, low=bar.low, close=bar.close) for bar in bars]
 
     def _accounts(self) -> list[dict[str, Any]]:
         if self._balance_cache is None:
@@ -786,6 +793,17 @@ class DryRunExchange:
         if self._market is None:
             raise UpbitAPIError("모의 캔들 원천이 없습니다.", retryable=False)
         return self._market.get_candles(market, unit, count)
+
+    def get_ohlcv_page(
+        self,
+        market: str,
+        unit: int,
+        count: int = 200,
+        to: str | None = None,
+    ) -> list[OhlcvBar]:
+        if self._market is None or not hasattr(self._market, "get_ohlcv_page"):
+            raise UpbitAPIError("이 시세 원천은 캔들 백필을 지원하지 않습니다.", retryable=False)
+        return self._market.get_ohlcv_page(market, unit, count, to)
 
     def quote_available(self, quote: str | None = None) -> Decimal:
         del quote

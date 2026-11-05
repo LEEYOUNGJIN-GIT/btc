@@ -8,3 +8,7 @@ trading.log
 trading.log.*
 position_state.json
 *.tmp
+data/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal

@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from typing import Sequence
 
+from analyzer import DynamicLevels, grid_buy_price, grid_sell_price
+
 
 # 2024-08-19 이후 USDT 마켓 호가 단위.
 # https://docs.upbit.com/kr/docs/usdt-market-info
@@ -146,11 +148,27 @@ class Strategy:
     def __init__(self, params: StrategyParams):
         params.validate()
         self.params = params
+        self.levels: DynamicLevels | None = None
+
+    def update_levels(self, levels: DynamicLevels | None) -> None:
+        """백필 분석 결과로 박스와 그리드 간격을 바꿉니다. None 이면 고정 퍼센트입니다."""
+        self.levels = levels
 
     def min_sell_price(self, buy_price: Decimal) -> Decimal:
-        """수수료와 목표 순수익률을 모두 반영한 최소 매도가."""
+        """수수료를 상회하는 최소 매도가.
+
+        동적 그리드가 있으면 그 간격(기본 0.20%~0.40%)과 수수료 손익분기 중 높은 쪽입니다.
+        그리드가 없으면 기존처럼 목표 순수익률을 수수료 위에 더합니다.
+        """
         if buy_price <= 0:
             raise ValueError("매수가가 올바르지 않습니다.")
+        if self.levels is not None:
+            return grid_sell_price(
+                buy_price,
+                self.levels.grid_rate,
+                self.params.buy_fee_rate,
+                self.params.sell_fee_rate,
+            )
         params = self.params
         one = Decimal("1")
         precise = (
@@ -168,6 +186,11 @@ class Strategy:
         raw = buy_price * (Decimal("1") - self.params.stop_loss_rate)
         return align_price(raw, "floor")
 
+    def _entry_frame(self, snapshot: MarketSnapshot) -> tuple[Decimal, Decimal, Decimal]:
+        if self.levels is not None and self.levels.resistance > self.levels.support > 0:
+            return self.levels.support, self.levels.resistance, self.levels.grid_rate
+        return snapshot.box_low, snapshot.box_high, self.params.buy_offset_rate
+
     def position_in_box(self, snapshot: MarketSnapshot) -> Decimal:
         span = snapshot.box_high - snapshot.box_low
         if span <= 0:
@@ -180,15 +203,17 @@ class Strategy:
             return Decision(None, "현재가 또는 호가가 없습니다.")
         if snapshot.best_ask <= snapshot.best_bid:
             return Decision(None, "호가가 교차되어 매수를 보류합니다.")
-        if snapshot.box_high <= snapshot.box_low:
+        box_low, box_high, offset_rate = self._entry_frame(snapshot)
+        if box_high <= box_low:
             return Decision(None, "박스 범위가 없어 매수를 보류합니다.")
 
         params = self.params
-        floor = snapshot.box_low * (Decimal("1") - params.breakdown_buffer)
+        floor = box_low * (Decimal("1") - params.breakdown_buffer)
         if snapshot.trade_price < floor:
             return Decision(None, "박스 하단을 이탈해 매수를 보류합니다.")
 
-        location = self.position_in_box(snapshot)
+        span = box_high - box_low
+        location = Decimal("1") if span <= 0 else (snapshot.trade_price - box_low) / span
         if location > params.entry_zone:
             return Decision(
                 None,
@@ -196,25 +221,33 @@ class Strategy:
                 f"(위치 {(location * 100):.2f}%, 허용 {(params.entry_zone * 100):.0f}%).",
             )
 
-        offset_price = snapshot.best_bid * (Decimal("1") - params.buy_offset_rate)
-        # 지지(박스 저가)와 '호가 아래 이격' 중 시장에 더 가까운 가격을 하단 매수가로 씁니다.
-        band = max(snapshot.box_low, offset_price)
-        raw = min(snapshot.best_bid, band)
-        if raw <= 0:
-            return Decision(None, "계산된 매수가가 0 이하입니다.")
-        price = align_price(raw, "floor")
-        if price >= snapshot.best_ask:
-            price = align_price(snapshot.best_bid, "floor")
-        if price <= 0 or price >= snapshot.best_ask:
-            return Decision(None, "테이커로 호가를 잠식하지 않도록 매수가를 만들지 못했습니다.")
+        if self.levels is not None:
+            price = grid_buy_price(snapshot.best_bid, snapshot.best_ask, box_low, offset_rate)
+            if price is None:
+                return Decision(None, "테이커로 호가를 잠식하지 않도록 매수가를 만들지 못했습니다.")
+        else:
+            offset_price = snapshot.best_bid * (Decimal("1") - offset_rate)
+            # 지지(박스 저가)와 '호가 아래 이격' 중 시장에 더 가까운 가격을 하단 매수가로 씁니다.
+            band = max(box_low, offset_price)
+            raw = min(snapshot.best_bid, band)
+            if raw <= 0:
+                return Decision(None, "계산된 매수가가 0 이하입니다.")
+            price = align_price(raw, "floor")
+            if price >= snapshot.best_ask:
+                price = align_price(snapshot.best_bid, "floor")
+            if price <= 0 or price >= snapshot.best_ask:
+                return Decision(None, "테이커로 호가를 잠식하지 않도록 매수가를 만들지 못했습니다.")
 
         sized = self._size_buy(quote_balance, price)
         if sized is None:
             return Decision(None, "주문 가능 USDT 가 최소 주문금액보다 작습니다.")
         volume, notional, fee_reserve = sized
+        grid_note = ""
+        if self.levels is not None:
+            grid_note = f", 그리드 {(offset_rate * 100):.3f}%"
         note = (
-            f"박스 {to_plain_str(snapshot.box_low)}~{to_plain_str(snapshot.box_high)}, "
-            f"위치 {(location * 100):.2f}%, 매수 {to_plain_str(price)}"
+            f"박스 {to_plain_str(box_low)}~{to_plain_str(box_high)}, "
+            f"위치 {(location * 100):.2f}%, 매수 {to_plain_str(price)}{grid_note}"
         )
         return Decision(
             BuyPlan(

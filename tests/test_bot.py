@@ -48,6 +48,7 @@ def make_config(**overrides: object) -> AppConfig:
         log_file="trading.log",
         log_level="WARNING",
         state_file="position_state.json",
+        backfill_enabled=False,
     )
     values.update(overrides)
     config = AppConfig(**values)  # type: ignore[arg-type]

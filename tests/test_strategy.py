@@ -1,6 +1,7 @@
 import unittest
 from decimal import Decimal
 
+from analyzer import DynamicLevels
 from strategy import (
     Candle,
     MarketSnapshot,
@@ -123,6 +124,30 @@ class EntryTests(unittest.TestCase):
     def test_small_balance_is_rejected(self) -> None:
         decision = self.strategy.plan_buy(self._snap("99.20", "99.20", "99.22"), Decimal("0.4"))
         self.assertIsNone(decision.plan)
+
+    def test_dynamic_grid_replaces_fixed_percent(self) -> None:
+        levels = DynamicLevels(
+            support=Decimal("99"),
+            resistance=Decimal("101"),
+            grid_rate=Decimal("0.003"),
+            atr=Decimal("0.30"),
+            atr_rate=Decimal("0.003"),
+            mean_range=Decimal("0.30"),
+            mean_range_rate=Decimal("0.003"),
+            round_trip_fee_rate=Decimal("0.001"),
+            sample_size=30,
+            last_close=Decimal("99.20"),
+        )
+        self.strategy.update_levels(levels)
+        decision = self.strategy.plan_buy(self._snap("99.20", "99.20", "99.22"), Decimal("1000"))
+        assert decision.plan is not None
+        self.assertEqual(decision.plan.price, Decimal("99"))
+        self.assertIn("그리드", decision.plan.note)
+        sell = self.strategy.min_sell_price(Decimal("100"))
+        self.assertEqual(sell, Decimal("100.30"))
+        cost = Decimal("100") * Decimal("1.0005")
+        proceeds = sell * Decimal("0.9995")
+        self.assertGreater(proceeds, cost)
 
     def test_box_from_candles(self) -> None:
         low, high = box_from_candles(
