@@ -8,7 +8,7 @@
 
 ## 동작
 
-1. 시작 시 `BACKFILL_MARKETS`(기본 `USDT-BTC,USDT-ETH`)의 최근 `BACKFILL_HOURS`(기본 24시간, 최대 14일) **분봉**을 SQLite에 받습니다. 이미 있는 구간은 다시 받지 않고, 페이지 사이에 쉬며 실패하면 재시도합니다. 주기 갱신은 거래 중인 `MARKET`만 이어 받습니다. GitHub 적재는 `python backfill.py`(기본 bundle)가 UTC **일봉 5년**(`data/daily/`)과 **분봉 7일**(`data/minute/`)을 쓰고, `python report.py` 가 둘 다 분석합니다.
+1. 시작 시 `BACKFILL_MARKETS`(기본 `USDT-BTC,USDT-ETH`)의 최근 `BACKFILL_HOURS`(기본 24시간, 최대 14일) **분봉**을 SQLite에 받습니다. 이미 있는 구간은 upsert로 갱신하고 창 밖 행은 prune 합니다. 봇이 켜져 있을 때만 `ANALYZE_REFRESH_SEC`마다 이어 받습니다. GitHub CSV는 봇과 별도로 **Actions 매일 갱신**(아래)합니다.
 2. 그 데이터로 ATR과 평균 고저폭을 내고, 최근 `RANGE_LOOKBACK`개 봉의 하위/상위 백분위로 박스 하단·상단을 잡습니다. 변동폭은 `MIN_GRID_RATE`~`MAX_GRID_RATE`(기본 0.20%~0.40%)로 자르며, 왕복 수수료 0.10%보다 좁으면 수수료 위로 올립니다.
 3. 현재가가 그 박스 **하단 구간**(`ENTRY_ZONE`, 기본 아래 40%)이고, 박스 하단을 이탈하지 않았을 때만 매수합니다.
 4. 매수가는 최우선 매수호가를 넘지 않습니다. 박스 저가와 그리드 간격만큼 아래 가격 중 체결에 더 가까운 쪽을 USDT 호가 단위로 내림합니다. 백필이 없으면 고정 `BUY_OFFSET_RATE`를 씁니다.
@@ -77,13 +77,20 @@ python main.py
 python -m unittest discover -s tests -v
 ```
 
-봇 없이 GitHub용 **일봉 5년 + 분봉 7일**을 받고 분석하려면:
+### 데이터 최신화 (봇이 꺼져 있어도)
+
+| 대상 | 갱신 주체 | 주기 |
+| --- | --- | --- |
+| 봇 런타임 SQLite 분봉 | `main.py` (켜져 있을 때만) | `ANALYZE_REFRESH_SEC`(기본 60초) |
+| GitHub `data/daily`·`data/minute`·`data/reports` | **GitHub Actions** `Refresh OHLCV` | 매일 00:15 UTC (+ 수동 `workflow_dispatch`) |
+
+Actions는 공개 시세만 쓰며 API 키가 필요 없습니다. 워크플로: `.github/workflows/refresh-ohlcv.yml`.
+
+로컬에서 같은 작업을 하려면:
 
 ```bash
-python backfill.py
-# == --timeframe bundle (data/daily + data/minute)
-python report.py
-# data/reports/analysis.json , analysis.md (스캘핑 구간 포함)
+python backfill.py          # bundle: 일봉 5년 + 분봉 7일 CSV
+python report.py            # 스캘핑 구간 리포트
 ```
 
 봇은 `MULTI_TF_ENABLED=true` 이면 분봉 백필과 `data/daily/ohlcv_{MARKET}.csv` 를 같이 보고

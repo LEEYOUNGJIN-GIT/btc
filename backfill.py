@@ -3,8 +3,9 @@
 캔들 REST 는 한 번에 최대 200개입니다. 이미 저장한 시각은 다시 끝까지
 당기지 않습니다. 요청 사이에는 쉬고, 오류가 나면 지수 간격으로 재시도합니다.
 
-봇 동적 단가는 최근 분봉을 쓰고, GitHub 적재용 장기 히스토리는 UTC 일봉을
-씁니다. `python backfill.py` 기본값은 USDT-BTC·USDT-ETH 최근 5년 일봉입니다.
+봇이 켜져 있으면 분봉 SQLite 를 증분 upsert+prune 합니다. GitHub CSV 는
+Actions cron(`refresh-ohlcv.yml`) 또는 `python backfill.py`(기본 bundle)로
+최신화합니다.
 """
 
 from __future__ import annotations
@@ -147,6 +148,15 @@ class CandleStore:
         )
         self._conn.commit()
         return self.count(market, unit) - before
+
+    def prune(self, market: str, unit: int, before_ms: int) -> int:
+        """백필 창보다 오래된 행을 지워 SQLite 를 창 크기로 유지합니다."""
+        cur = self._conn.execute(
+            "DELETE FROM candles WHERE market = ? AND unit = ? AND timestamp_ms < ?",
+            (market, unit, before_ms),
+        )
+        self._conn.commit()
+        return int(cur.rowcount or 0)
 
     def load(self, market: str, unit: int, start_ms: int | None = None) -> list[OhlcvBar]:
         if start_ms is None:
@@ -323,6 +333,10 @@ def backfill_ohlcv(
         cursor = ordered[0].open_time
         if page_sleep > 0:
             sleep(page_sleep)
+
+    removed = store.prune(market, unit, start_ms)
+    if removed:
+        logger.info("백필 창 밖 %s행 정리 | %s unit=%s", removed, market, unit)
 
     stored_min, stored_max, stored = store.coverage(market, unit)
     return BackfillResult(

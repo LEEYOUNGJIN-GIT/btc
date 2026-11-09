@@ -65,9 +65,13 @@ class BackfillTests(unittest.TestCase):
                 retry_delay=0,
                 sleep=lambda _seconds: None,
             )
+            start_ms = now - 6 * 3_600_000
+            kept = store.count("USDT-BTC", 1)
             self.assertEqual(first.pages, 2)
             self.assertEqual(first.new_rows, 400)
-            self.assertEqual(store.count("USDT-BTC", 1), 400)
+            self.assertEqual(first.stored_rows, kept)
+            self.assertLessEqual(kept, 400)
+            self.assertTrue(all(bar.timestamp_ms >= start_ms for bar in store.load("USDT-BTC", 1)))
             self.assertEqual(calls, [None, first_oldest])
 
             calls.clear()
@@ -84,9 +88,9 @@ class BackfillTests(unittest.TestCase):
             )
             self.assertEqual(second.pages, 1)
             self.assertEqual(second.new_rows, 0)
-            self.assertEqual(store.count("USDT-BTC", 1), 400)
+            self.assertEqual(store.count("USDT-BTC", 1), kept)
             csv_path = Path(folder) / "ohlcv.csv"
-            self.assertEqual(store.export_csv("USDT-BTC", 1, str(csv_path)), 400)
+            self.assertEqual(store.export_csv("USDT-BTC", 1, str(csv_path)), kept)
             header = csv_path.read_text(encoding="utf-8").splitlines()[0]
             self.assertEqual(header, "timestamp_ms,open_time,open,high,low,close,volume")
             store.close()
@@ -188,6 +192,19 @@ class BackfillTests(unittest.TestCase):
             self.assertEqual(written["USDT-ETH"], 3)
             self.assertTrue(Path(csv_path_for_market(csv_root, "USDT-BTC")).exists())
             self.assertTrue(Path(csv_path_for_market(csv_root, "USDT-ETH")).exists())
+            store.close()
+
+    def test_prune_removes_rows_before_window(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            store = CandleStore(str(Path(folder) / "ohlcv.sqlite"))
+            now = 2_000_000_000_000
+            old = OhlcvBar(now - 10_000_000, "old", Decimal("1"), Decimal("1"), Decimal("1"), Decimal("1"), Decimal("1"))
+            fresh = OhlcvBar(now - 1_000, "fresh", Decimal("2"), Decimal("2"), Decimal("2"), Decimal("2"), Decimal("2"))
+            store.upsert("USDT-BTC", 1, [old, fresh])
+            self.assertEqual(store.count("USDT-BTC", 1), 2)
+            removed = store.prune("USDT-BTC", 1, now - 5_000)
+            self.assertEqual(removed, 1)
+            self.assertEqual(store.count("USDT-BTC", 1), 1)
             store.close()
 
     def test_daily_backfill_uses_day_unit(self) -> None:
