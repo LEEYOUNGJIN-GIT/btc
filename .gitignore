@@ -8,14 +8,20 @@ trading.log
 trading.log.*
 backfill.log
 backfill.log.*
+report.log
+report.log.*
 position_state.json
 *.tmp
-# 런타임 SQLite/분봉 캐시는 제외. UTC 일봉 CSV 는 GitHub 적재 대상입니다.
+# 런타임 SQLite 제외. GitHub 적재: daily / minute / reports CSV·JSON·MD
 data/*
 !data/daily/
 !data/daily/**
-data/daily/*.sqlite
-data/daily/*.sqlite-*
+!data/minute/
+!data/minute/**
+!data/reports/
+!data/reports/**
+data/**/*.sqlite
+data/**/*.sqlite-*
 *.sqlite
 *.sqlite-journal
 *.sqlite-wal

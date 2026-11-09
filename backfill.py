@@ -32,6 +32,11 @@ DEFAULT_DAILY_DAYS = 1825
 MAX_DAILY_DAYS = 3650
 DEFAULT_DAILY_CSV = "data/daily/ohlcv.csv"
 DEFAULT_DAILY_DB = "data/daily/ohlcv.sqlite"
+# 봇 analyzer 룩백(120분+)을 충분히 덮는 GitHub용 분봉. 7일·1분·2마켓 ~3MB.
+DEFAULT_MINUTE_HOURS = 168
+MAX_MINUTE_HOURS = 24 * 14
+DEFAULT_MINUTE_CSV = "data/minute/ohlcv.csv"
+DEFAULT_MINUTE_DB = "data/minute/ohlcv.sqlite"
 
 PageFetcher = Callable[[str, int, int, str | None], Sequence["OhlcvBar"]]
 
@@ -393,6 +398,32 @@ def export_markets_csv(
     return written
 
 
+def load_ohlcv_csv(path: str) -> list[OhlcvBar]:
+    """GitHub 적재 CSV 를 OhlcvBar 목록으로 읽습니다. open_time 은 UTC 문자열입니다."""
+    target = Path(path)
+    if not target.is_file():
+        raise FileNotFoundError(f"OHLCV CSV 가 없습니다: {path}")
+    bars: list[OhlcvBar] = []
+    with target.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        required = {"timestamp_ms", "open_time", "open", "high", "low", "close", "volume"}
+        if reader.fieldnames is None or not required.issubset(set(reader.fieldnames)):
+            raise ValueError(f"OHLCV CSV 헤더가 올바르지 않습니다: {path}")
+        for row in reader:
+            bars.append(
+                OhlcvBar(
+                    timestamp_ms=int(row["timestamp_ms"]),
+                    open_time=str(row["open_time"]),
+                    open=Decimal(row["open"]),
+                    high=Decimal(row["high"]),
+                    low=Decimal(row["low"]),
+                    close=Decimal(row["close"]),
+                    volume=Decimal(row["volume"]),
+                )
+            )
+    return sorted(bars, key=lambda bar: bar.timestamp_ms)
+
+
 def _fetch_with_retry(
     fetch_page: PageFetcher,
     market: str,
@@ -453,7 +484,7 @@ def parse_upbit_candle(row: dict) -> OhlcvBar:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="업비트 USDT-BTC·USDT-ETH 캔들 백필 (기본: UTC 일봉 5년, GitHub data/daily/)"
+        description="업비트 USDT-BTC·USDT-ETH 캔들 백필 (일봉 5년 + 분봉 7일 GitHub 적재)"
     )
     parser.add_argument(
         "--markets",
@@ -462,9 +493,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--timeframe",
-        choices=("day", "minute"),
-        default="day",
-        help="day=UTC 일봉(기본, GitHub 적재), minute=봇용 분봉",
+        choices=("day", "minute", "bundle"),
+        default="bundle",
+        help="bundle=일봉+분봉(기본), day=UTC 일봉, minute=1분봉",
     )
     parser.add_argument(
         "--days",
@@ -472,13 +503,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_DAILY_DAYS,
         help=f"일봉 기간(UTC). 권고 기본 {DEFAULT_DAILY_DAYS}일(~5년), 최대 {MAX_DAILY_DAYS}",
     )
-    parser.add_argument("--hours", type=int, default=24, help="분봉일 때 최근 몇 시간")
+    parser.add_argument(
+        "--hours",
+        type=int,
+        default=DEFAULT_MINUTE_HOURS,
+        help=f"분봉 기간. 권고 기본 {DEFAULT_MINUTE_HOURS}시간(7일), 최대 {MAX_MINUTE_HOURS}",
+    )
     parser.add_argument("--unit", type=int, default=1, help="분봉 단위(timeframe=minute)")
     parser.add_argument("--db", default="", help="SQLite 경로. 비우면 timeframe 기본 경로")
     parser.add_argument(
         "--csv",
         default="",
-        help="CSV 경로. day 기본은 data/daily/ohlcv.csv. 여러 마켓이면 파일명에 마켓을 붙입니다.",
+        help="CSV 경로. 비우면 day/minute 기본 경로. 여러 마켓이면 파일명에 마켓을 붙입니다.",
     )
     parser.add_argument("--page-sleep", type=float, default=0.15, help="페이지 사이 대기(초)")
     parser.add_argument("--market-sleep", type=float, default=0.2, help="마켓 사이 대기(초)")
@@ -487,30 +523,54 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_backfill(
+    *,
+    client: object,
+    markets: Sequence[str],
+    unit: int,
+    hours: int,
+    days: int | None,
+    db_path: str,
+    csv_path: str,
+    span_ms: int,
+    page_sleep: float,
+    market_sleep: float,
+    max_retries: int,
+    retry_delay: float,
+) -> dict[str, BackfillResult]:
+    with CandleStore(db_path) as store:
+        results = backfill_markets(
+            client.get_ohlcv_page,  # type: ignore[attr-defined]
+            store,
+            markets,
+            unit,
+            hours,
+            days=days,
+            page_sleep=page_sleep,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            market_sleep=market_sleep,
+        )
+        if csv_path:
+            start_ms = int(time.time() * 1000) - span_ms
+            written = export_markets_csv(store, markets, unit, csv_path, start_ms)
+            for market, rows in written.items():
+                out = csv_path_for_market(csv_path, market) if len(markets) > 1 else csv_path
+                logger.info("백필 CSV %s행 저장: %s", rows, out)
+    for market, result in results.items():
+        logger.info(
+            "백필 완료 %s | 페이지 %s | 신규 %s | 저장 %s",
+            market,
+            result.pages,
+            result.new_rows,
+            result.stored_rows,
+        )
+    return results
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     markets = parse_markets(args.markets)
-    daily = args.timeframe == "day"
-    if daily:
-        if not 1 <= args.days <= MAX_DAILY_DAYS:
-            raise SystemExit(f"days 는 1~{MAX_DAILY_DAYS} 이어야 합니다.")
-        unit = DAY_UNIT
-        days: int | None = args.days
-        hours = 0
-        db_path = args.db or DEFAULT_DAILY_DB
-        csv_path = args.csv if args.csv != "" else DEFAULT_DAILY_CSV
-        span_ms = args.days * 86_400_000
-    else:
-        if args.hours < 1:
-            raise SystemExit("hours 는 1 이상이어야 합니다.")
-        if args.unit not in {1, 3, 5, 10, 15, 30, 60, 240}:
-            raise SystemExit("unit 이 업비트 분봉 단위가 아닙니다.")
-        unit = args.unit
-        days = None
-        hours = args.hours
-        db_path = args.db or "data/ohlcv.sqlite"
-        csv_path = args.csv
-        span_ms = args.hours * 3_600_000
 
     # exchange_api 가 backfill 을 import 하므로 CLI 진입 시에만 가져옵니다.
     from exchange_api import UpbitREST
@@ -527,33 +587,53 @@ def main(argv: Sequence[str] | None = None) -> int:
         account_rps=15.0,
         order_rps=6.0,
     )
-    with CandleStore(db_path) as store:
-        results = backfill_markets(
-            client.get_ohlcv_page,
-            store,
-            markets,
-            unit,
-            hours,
+
+    jobs: list[tuple[str, int, int, int | None, str, str, int]] = []
+    if args.timeframe in {"day", "bundle"}:
+        if not 1 <= args.days <= MAX_DAILY_DAYS:
+            raise SystemExit(f"days 는 1~{MAX_DAILY_DAYS} 이어야 합니다.")
+        jobs.append(
+            (
+                "day",
+                DAY_UNIT,
+                0,
+                args.days,
+                args.db or DEFAULT_DAILY_DB if args.timeframe == "day" else DEFAULT_DAILY_DB,
+                (args.csv if args.csv and args.timeframe == "day" else DEFAULT_DAILY_CSV),
+                args.days * 86_400_000,
+            )
+        )
+    if args.timeframe in {"minute", "bundle"}:
+        if not 1 <= args.hours <= MAX_MINUTE_HOURS:
+            raise SystemExit(f"hours 는 1~{MAX_MINUTE_HOURS} 이어야 합니다.")
+        if args.unit not in {1, 3, 5, 10, 15, 30, 60, 240}:
+            raise SystemExit("unit 이 업비트 분봉 단위가 아닙니다.")
+        jobs.append(
+            (
+                "minute",
+                args.unit,
+                args.hours,
+                None,
+                args.db or DEFAULT_MINUTE_DB if args.timeframe == "minute" else DEFAULT_MINUTE_DB,
+                (args.csv if args.csv and args.timeframe == "minute" else DEFAULT_MINUTE_CSV),
+                args.hours * 3_600_000,
+            )
+        )
+
+    for _name, unit, hours, days, db_path, csv_path, span_ms in jobs:
+        _run_backfill(
+            client=client,
+            markets=markets,
+            unit=unit,
+            hours=hours,
             days=days,
+            db_path=db_path,
+            csv_path=csv_path,
+            span_ms=span_ms,
             page_sleep=args.page_sleep,
+            market_sleep=args.market_sleep,
             max_retries=args.max_retries,
             retry_delay=args.retry_delay,
-            market_sleep=args.market_sleep,
-        )
-        if csv_path:
-            start_ms = int(time.time() * 1000) - span_ms
-            written = export_markets_csv(store, markets, unit, csv_path, start_ms)
-            for market, rows in written.items():
-                out = csv_path_for_market(csv_path, market) if len(markets) > 1 else csv_path
-                logger.info("백필 CSV %s행 저장: %s", rows, out)
-
-    for market, result in results.items():
-        logger.info(
-            "백필 완료 %s | 페이지 %s | 신규 %s | 저장 %s",
-            market,
-            result.pages,
-            result.new_rows,
-            result.stored_rows,
         )
     return 0
 

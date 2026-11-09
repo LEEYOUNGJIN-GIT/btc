@@ -1,0 +1,119 @@
+{
+  "minute": [
+    {
+      "path": "data/minute/ohlcv_USDT-BTC.csv",
+      "bar_count": 2733,
+      "first_open_time_utc": "2026-11-02T03:37:00",
+      "last_open_time_utc": "2026-11-09T03:30:00",
+      "dynamic_levels": {
+        "support": "74335.0600000000",
+        "resistance": "75912.0510000000",
+        "grid_rate": "0.002",
+        "grid_rate_pct": "0.2000%",
+        "atr": "45.45214285714285714285714286",
+        "atr_rate_pct": "0.0605%",
+        "mean_range_rate_pct": "0.0541%",
+        "round_trip_fee_rate_pct": "0.1000%",
+        "sample_size": 120,
+        "last_close": "75075.97000000"
+      },
+      "history": {
+        "total_return_pct": "-4.4579%",
+        "max_drawdown_pct": "8.3556%",
+        "mean_range_rate_pct": "0.0342%",
+        "first_close": "78578.90000000",
+        "last_close": "75075.97000000",
+        "high": "81000.00000000",
+        "low": "74170.13000000"
+      },
+      "market": "USDT-BTC"
+    },
+    {
+      "path": "data/minute/ohlcv_USDT-ETH.csv",
+      "bar_count": 858,
+      "first_open_time_utc": "2026-11-02T03:41:00",
+      "last_open_time_utc": "2026-11-09T03:19:00",
+      "dynamic_levels": {
+        "support": "2130.0000000000",
+        "resistance": "2241.6400000000",
+        "grid_rate": "0.002",
+        "grid_rate_pct": "0.2000%",
+        "atr": "3.689285714285714285714285714",
+        "atr_rate_pct": "0.1719%",
+        "mean_range_rate_pct": "0.1077%",
+        "round_trip_fee_rate_pct": "0.1000%",
+        "sample_size": 120,
+        "last_close": "2146.13000000"
+      },
+      "history": {
+        "total_return_pct": "-7.0799%",
+        "max_drawdown_pct": "13.6693%",
+        "mean_range_rate_pct": "0.0748%",
+        "first_close": "2309.65000000",
+        "last_close": "2146.13000000",
+        "high": "2449.35000000",
+        "low": "2114.54000000"
+      },
+      "market": "USDT-ETH"
+    }
+  ],
+  "daily": [
+    {
+      "path": "data/daily/ohlcv_USDT-BTC.csv",
+      "bar_count": 1825,
+      "first_open_time_utc": "2021-11-11T00:00:00",
+      "last_open_time_utc": "2026-11-09T00:00:00",
+      "dynamic_levels": {
+        "support": "63089.8880000000",
+        "resistance": "84954.5120000000",
+        "grid_rate": "0.004",
+        "grid_rate_pct": "0.4000%",
+        "atr": "2130.14500000",
+        "atr_rate_pct": "2.8384%",
+        "mean_range_rate_pct": "2.5287%",
+        "round_trip_fee_rate_pct": "0.1000%",
+        "sample_size": 120,
+        "last_close": "75047.67000000"
+      },
+      "history": {
+        "total_return_pct": "16.1274%",
+        "max_drawdown_pct": "76.1297%",
+        "mean_range_rate_pct": "4.1563%",
+        "first_close": "64625.30000000",
+        "last_close": "75047.67000000",
+        "high": "125989.00000000",
+        "low": "14503.00000000"
+      },
+      "market": "USDT-BTC"
+    },
+    {
+      "path": "data/daily/ohlcv_USDT-ETH.csv",
+      "bar_count": 1825,
+      "first_open_time_utc": "2021-11-11T00:00:00",
+      "last_open_time_utc": "2026-11-09T00:00:00",
+      "dynamic_levels": {
+        "support": "1856.5430000000",
+        "resistance": "2717.1350000000",
+        "grid_rate": "0.004",
+        "grid_rate_pct": "0.4000%",
+        "atr": "83.95428571428571428571428571",
+        "atr_rate_pct": "3.9119%",
+        "mean_range_rate_pct": "3.7494%",
+        "round_trip_fee_rate_pct": "0.1000%",
+        "sample_size": 120,
+        "last_close": "2146.13000000"
+      },
+      "history": {
+        "total_return_pct": "-54.9133%",
+        "max_drawdown_pct": "79.1134%",
+        "mean_range_rate_pct": "5.9626%",
+        "first_close": "4760.00899995",
+        "last_close": "2146.13000000",
+        "high": "4994.00000000",
+        "low": "889.12954260"
+      },
+      "market": "USDT-ETH"
+    }
+  ],
+  "daily_btc_eth_close_correlation": "0.662851"
+}

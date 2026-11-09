@@ -173,6 +173,81 @@ def bars_are_stale(bars: Sequence[OhlcvBar], unit_minutes: int, now_ms: int) -> 
     return now_ms - newest > allowance
 
 
+@dataclass(frozen=True)
+class HistoryStats:
+    bar_count: int
+    first_open_time: str
+    last_open_time: str
+    first_close: Decimal
+    last_close: Decimal
+    total_return: Decimal
+    max_drawdown: Decimal
+    mean_range_rate: Decimal
+    high: Decimal
+    low: Decimal
+
+
+def history_stats(bars: Sequence[OhlcvBar]) -> HistoryStats:
+    """장기 OHLCV(일봉·분봉)에서 수익률·낙폭·평균 고저폭을 요약합니다."""
+    ordered = sorted(bars, key=lambda bar: bar.timestamp_ms)
+    if len(ordered) < 2:
+        raise ValueError("히스토리 요약에는 캔들이 2개 이상 필요합니다.")
+    first = ordered[0]
+    last = ordered[-1]
+    if first.close <= 0 or last.close <= 0:
+        raise ValueError("종가가 0 이하입니다.")
+    peak = ordered[0].close
+    max_dd = Decimal("0")
+    range_sum = Decimal("0")
+    high = ordered[0].high
+    low = ordered[0].low
+    for bar in ordered:
+        high = max(high, bar.high)
+        low = min(low, bar.low)
+        range_sum += (bar.high - bar.low) / bar.close if bar.close > 0 else Decimal("0")
+        if bar.close > peak:
+            peak = bar.close
+        if peak > 0:
+            drawdown = (peak - bar.close) / peak
+            if drawdown > max_dd:
+                max_dd = drawdown
+    return HistoryStats(
+        bar_count=len(ordered),
+        first_open_time=first.open_time,
+        last_open_time=last.open_time,
+        first_close=first.close,
+        last_close=last.close,
+        total_return=(last.close - first.close) / first.close,
+        max_drawdown=max_dd,
+        mean_range_rate=range_sum / Decimal(len(ordered)),
+        high=high,
+        low=low,
+    )
+
+
+def close_correlation(left: Sequence[OhlcvBar], right: Sequence[OhlcvBar]) -> Decimal | None:
+    """동일 open_time(UTC) 종가 상관계수. 겹치는 봉이 2개 미만이면 None."""
+    right_map = {bar.open_time: bar.close for bar in right}
+    pairs: list[tuple[Decimal, Decimal]] = []
+    for bar in left:
+        other = right_map.get(bar.open_time)
+        if other is None:
+            continue
+        pairs.append((bar.close, other))
+    if len(pairs) < 2:
+        return None
+    n = Decimal(len(pairs))
+    mean_x = sum((p[0] for p in pairs), Decimal("0")) / n
+    mean_y = sum((p[1] for p in pairs), Decimal("0")) / n
+    cov = sum(((p[0] - mean_x) * (p[1] - mean_y) for p in pairs), Decimal("0"))
+    var_x = sum(((p[0] - mean_x) ** 2 for p in pairs), Decimal("0"))
+    var_y = sum(((p[1] - mean_y) ** 2 for p in pairs), Decimal("0"))
+    if var_x <= 0 or var_y <= 0:
+        return None
+    # Decimal sqrt
+    return cov / (var_x * var_y).sqrt()
+
+
 def _percentile(values: Sequence[Decimal], quantile: Decimal) -> Decimal:
     if not values:
         raise ValueError("백분위 계산에 값이 없습니다.")

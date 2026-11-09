@@ -8,7 +8,7 @@
 
 ## 동작
 
-1. 시작 시 `BACKFILL_MARKETS`(기본 `USDT-BTC,USDT-ETH`)의 최근 `BACKFILL_HOURS`(기본 24시간, 최대 14일) **분봉**을 SQLite에 받습니다. 이미 있는 구간은 다시 받지 않고, 페이지 사이에 쉬며 실패하면 재시도합니다. 주기 갱신은 거래 중인 `MARKET`만 이어 받습니다. 장기 히스토리(GitHub 적재)는 UTC **일봉**으로 `python backfill.py` 가 `data/daily/` 에 씁니다(권고 5년).
+1. 시작 시 `BACKFILL_MARKETS`(기본 `USDT-BTC,USDT-ETH`)의 최근 `BACKFILL_HOURS`(기본 24시간, 최대 14일) **분봉**을 SQLite에 받습니다. 이미 있는 구간은 다시 받지 않고, 페이지 사이에 쉬며 실패하면 재시도합니다. 주기 갱신은 거래 중인 `MARKET`만 이어 받습니다. GitHub 적재는 `python backfill.py`(기본 bundle)가 UTC **일봉 5년**(`data/daily/`)과 **분봉 7일**(`data/minute/`)을 쓰고, `python report.py` 가 둘 다 분석합니다.
 2. 그 데이터로 ATR과 평균 고저폭을 내고, 최근 `RANGE_LOOKBACK`개 봉의 하위/상위 백분위로 박스 하단·상단을 잡습니다. 변동폭은 `MIN_GRID_RATE`~`MAX_GRID_RATE`(기본 0.20%~0.40%)로 자르며, 왕복 수수료 0.10%보다 좁으면 수수료 위로 올립니다.
 3. 현재가가 그 박스 **하단 구간**(`ENTRY_ZONE`, 기본 아래 40%)이고, 박스 하단을 이탈하지 않았을 때만 매수합니다.
 4. 매수가는 최우선 매수호가를 넘지 않습니다. 박스 저가와 그리드 간격만큼 아래 가격 중 체결에 더 가까운 쪽을 USDT 호가 단위로 내림합니다. 백필이 없으면 고정 `BUY_OFFSET_RATE`를 씁니다.
@@ -33,8 +33,11 @@
 | `main.py` | 상태 머신, 시작 시 백필, 동적 단가 갱신 |
 | `config.py` | `.env` 설정. 백필 기간·그리드 범위 포함 |
 | `exchange_api.py` | 잔고, 시세, 분봉 페이지, 주문, 현재가 WebSocket |
-| `backfill.py` | 분봉(봇)·UTC 일봉(GitHub `data/daily/`) OHLCV 수집 CLI |
-| `data/daily/` | BTC·ETH UTC 일봉 CSV (권고 5년, 커밋 대상) |
+| `backfill.py` | 일봉 5년 + 분봉 7일 GitHub CSV 수집 CLI (`--timeframe bundle`) |
+| `report.py` | `data/minute`·`data/daily` 를 ATR/박스/그리드·수익률·낙폭으로 분석 |
+| `data/daily/` | BTC·ETH UTC 일봉 CSV (권고 5년) |
+| `data/minute/` | BTC·ETH UTC 1분봉 CSV (권고 7일, analyzer 동일 지표) |
+| `data/reports/` | `report.py` 결과 JSON/Markdown |
 | `analyzer.py` | ATR, 고저폭, 박스, 0.20%~0.40% 그리드 단가 |
 | `strategy.py` | 동적 단가가 있을 때 그 가격으로, 없으면 고정 퍼센트로 주문 |
 | `logger.py` | 콘솔 + `trading.log` 회전 로그 |
@@ -73,17 +76,20 @@ python main.py
 python -m unittest discover -s tests -v
 ```
 
-봇 없이 BTC·ETH **UTC 일봉**(권고 5년)을 GitHub용 CSV로 받으려면:
+봇 없이 GitHub용 **일봉 5년 + 분봉 7일**을 받고 분석하려면:
 
 ```bash
 python backfill.py
-# 동일: --timeframe day --days 1825 --csv data/daily/ohlcv.csv
+# == --timeframe bundle (data/daily + data/minute)
+python report.py
+# data/reports/analysis.json , analysis.md
 ```
 
-분봉만 받으려면:
+일봉만 / 분봉만:
 
 ```bash
-python backfill.py --timeframe minute --markets USDT-BTC,USDT-ETH --hours 24 --db data/ohlcv.sqlite --csv ""
+python backfill.py --timeframe day --days 1825
+python backfill.py --timeframe minute --hours 168
 ```
 
 ## .env

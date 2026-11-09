@@ -11,4 +11,5 @@
 
 파일명 예: `ohlcv_USDT-BTC.csv`, `ohlcv_USDT-ETH.csv`
 
-봇 동적 단가(ATR·박스)는 이 폴더가 아니라 **최근 분봉**(`BACKFILL_HOURS`)을 사용합니다.
+봇 실시간 동적 단가는 기동 시 **분봉 백필**을 씁니다. 이 폴더 일봉은 `python report.py` 로
+장기 수익률·낙폭·그리드 요약에 연결됩니다. 분봉 오프라인 분석은 `data/minute/` 를 봅니다.
