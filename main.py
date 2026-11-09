@@ -18,7 +18,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from analyzer import analyze, bars_are_stale, closed_bars
-from backfill import CandleStore, backfill_ohlcv
+from backfill import CandleStore, backfill_markets, backfill_ohlcv, csv_path_for_market, export_markets_csv
 from config import AppConfig, load_config
 from exchange_api import (
     NullFeed,
@@ -818,40 +818,65 @@ class RoundTripBot:
         if not force and now - self._levels_monotonic < self.cfg.analyze_refresh_sec:
             return
         try:
-            self._refresh_dynamic_levels()
+            self._refresh_dynamic_levels(warm_all=force)
         except Exception:
             logger.exception("동적 단가 갱신 실패. 마지막 산출값 또는 고정 간격을 유지합니다.")
         finally:
             self._levels_monotonic = now
 
-    def _refresh_dynamic_levels(self) -> None:
+    def _refresh_dynamic_levels(self, *, warm_all: bool = False) -> None:
         start_ms = int(time.time() * 1000) - self.cfg.backfill_hours * 3_600_000
+        targets = self.cfg.backfill_markets if warm_all else (self.cfg.market,)
         with CandleStore(self.cfg.backfill_db) as store:
-            result = backfill_ohlcv(
-                self.exchange.get_ohlcv_page,
-                store,
-                self.cfg.market,
-                self.cfg.backfill_unit,
-                self.cfg.backfill_hours,
-                page_sleep=self.cfg.backfill_page_sleep,
-                max_retries=self.cfg.max_retries,
-                retry_delay=self.cfg.retry_delay_sec,
-            )
+            if len(targets) == 1:
+                results = {
+                    targets[0]: backfill_ohlcv(
+                        self.exchange.get_ohlcv_page,
+                        store,
+                        targets[0],
+                        self.cfg.backfill_unit,
+                        self.cfg.backfill_hours,
+                        page_sleep=self.cfg.backfill_page_sleep,
+                        max_retries=self.cfg.max_retries,
+                        retry_delay=self.cfg.retry_delay_sec,
+                    )
+                }
+            else:
+                results = backfill_markets(
+                    self.exchange.get_ohlcv_page,
+                    store,
+                    targets,
+                    self.cfg.backfill_unit,
+                    self.cfg.backfill_hours,
+                    page_sleep=self.cfg.backfill_page_sleep,
+                    max_retries=self.cfg.max_retries,
+                    retry_delay=self.cfg.retry_delay_sec,
+                    market_sleep=self.cfg.backfill_page_sleep,
+                )
             bars = store.load(self.cfg.market, self.cfg.backfill_unit, start_ms)
             if self.cfg.backfill_csv:
-                written = store.export_csv(
-                    self.cfg.market,
+                written = export_markets_csv(
+                    store,
+                    targets,
                     self.cfg.backfill_unit,
                     self.cfg.backfill_csv,
                     start_ms,
                 )
-                logger.info("백필 CSV %s행 저장: %s", written, self.cfg.backfill_csv)
-        logger.info(
-            "백필 완료 | 페이지 %s | 신규 %s | 저장 %s",
-            result.pages,
-            result.new_rows,
-            result.stored_rows,
-        )
+                for market, rows in written.items():
+                    path = (
+                        csv_path_for_market(self.cfg.backfill_csv, market)
+                        if len(targets) > 1
+                        else self.cfg.backfill_csv
+                    )
+                    logger.info("백필 CSV %s행 저장: %s", rows, path)
+        for market, result in results.items():
+            logger.info(
+                "백필 완료 %s | 페이지 %s | 신규 %s | 저장 %s",
+                market,
+                result.pages,
+                result.new_rows,
+                result.stored_rows,
+            )
         now_ms = int(time.time() * 1000)
         if bars_are_stale(bars, self.cfg.backfill_unit, now_ms):
             logger.warning(

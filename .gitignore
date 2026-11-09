@@ -6,6 +6,8 @@ __pycache__/
 .pytest_cache/
 trading.log
 trading.log.*
+backfill.log
+backfill.log.*
 position_state.json
 *.tmp
 data/

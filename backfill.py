@@ -3,22 +3,29 @@
 캔들 REST 는 한 번에 최대 200개입니다. 24시간~7일치는 여러 번 나눠 받고,
 이미 저장한 시각은 다시 끝까지 당기지 않습니다. 요청 사이에는 쉬고,
 오류가 나면 지수 간격으로 재시도합니다.
+
+기본 대상은 USDT-BTC 와 USDT-ETH 입니다. `python backfill.py` 로
+봇 없이 공개 시세만 받아 저장할 수 있습니다.
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
 import sqlite3
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 from logger import get_logger
 
 logger = get_logger()
+
+DEFAULT_BACKFILL_MARKETS = ("USDT-BTC", "USDT-ETH")
 
 PageFetcher = Callable[[str, int, int, str | None], Sequence["OhlcvBar"]]
 
@@ -186,6 +193,43 @@ class CandleStore:
         return len(bars)
 
 
+def parse_markets(raw: str | Sequence[str] | None, *, default: Sequence[str] = DEFAULT_BACKFILL_MARKETS) -> tuple[str, ...]:
+    """콤마/세미콜론으로 나뉜 마켓 목록을 정규화합니다. 비어 있으면 기본값(BTC·ETH)입니다."""
+    if raw is None:
+        values: list[str] = []
+    elif isinstance(raw, str):
+        values = [part.strip() for part in raw.replace(";", ",").split(",")]
+    else:
+        values = []
+        for item in raw:
+            values.extend(part.strip() for part in str(item).replace(";", ",").split(","))
+    markets: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        market = value.upper()
+        if not market or market in seen:
+            continue
+        parts = market.split("-")
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            raise ValueError(f"마켓 코드가 올바르지 않습니다: {value}")
+        seen.add(market)
+        markets.append(market)
+    if not markets:
+        return tuple(default)
+    return tuple(markets)
+
+
+def ensure_market(markets: Sequence[str], market: str) -> tuple[str, ...]:
+    """거래 마켓이 목록에 없으면 맨 앞에 넣습니다."""
+    normalized = parse_markets(markets)
+    target = market.strip().upper()
+    if not target:
+        return normalized
+    if target in normalized:
+        return normalized
+    return (target, *normalized)
+
+
 def backfill_ohlcv(
     fetch_page: PageFetcher,
     store: CandleStore,
@@ -263,6 +307,68 @@ def backfill_ohlcv(
     )
 
 
+def backfill_markets(
+    fetch_page: PageFetcher,
+    store: CandleStore,
+    markets: Sequence[str],
+    unit: int,
+    hours: int,
+    *,
+    now_ms: int | None = None,
+    page_size: int = 200,
+    page_sleep: float = 0.15,
+    max_retries: int = 5,
+    retry_delay: float = 1.0,
+    sleep: Callable[[float], None] = time.sleep,
+    market_sleep: float = 0.0,
+) -> dict[str, BackfillResult]:
+    """여러 마켓을 순서대로 백필합니다. 기본 대상은 BTC·ETH 입니다."""
+    targets = parse_markets(markets)
+    results: dict[str, BackfillResult] = {}
+    for index, market in enumerate(targets):
+        logger.info("마켓 백필 시작 %s (%s/%s)", market, index + 1, len(targets))
+        results[market] = backfill_ohlcv(
+            fetch_page,
+            store,
+            market,
+            unit,
+            hours,
+            now_ms=now_ms,
+            page_size=page_size,
+            page_sleep=page_sleep,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            sleep=sleep,
+        )
+        if market_sleep > 0 and index + 1 < len(targets):
+            sleep(market_sleep)
+    return results
+
+
+def csv_path_for_market(path: str, market: str) -> str:
+    """단일 CSV 경로에 마켓 코드를 붙여 파일명을 만듭니다."""
+    target = Path(path)
+    safe = market.replace("/", "-").replace(" ", "")
+    if target.suffix:
+        return str(target.with_name(f"{target.stem}_{safe}{target.suffix}"))
+    return str(target / f"{safe}.csv")
+
+
+def export_markets_csv(
+    store: CandleStore,
+    markets: Sequence[str],
+    unit: int,
+    path: str,
+    start_ms: int | None = None,
+) -> Mapping[str, int]:
+    targets = parse_markets(markets)
+    written: dict[str, int] = {}
+    for market in targets:
+        out = csv_path_for_market(path, market) if len(targets) > 1 else path
+        written[market] = store.export_csv(market, unit, out, start_ms)
+    return written
+
+
 def _fetch_with_retry(
     fetch_page: PageFetcher,
     market: str,
@@ -319,3 +425,77 @@ def parse_upbit_candle(row: dict) -> OhlcvBar:
         close=Decimal(str(row["trade_price"])),
         volume=Decimal(str(row.get("candle_acc_trade_volume") or "0")),
     )
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="업비트 USDT-BTC·USDT-ETH 분봉 백필")
+    parser.add_argument(
+        "--markets",
+        default=",".join(DEFAULT_BACKFILL_MARKETS),
+        help="콤마로 구분한 마켓. 기본 USDT-BTC,USDT-ETH",
+    )
+    parser.add_argument("--hours", type=int, default=24, help="최근 몇 시간을 채울지")
+    parser.add_argument("--unit", type=int, default=1, help="분봉 단위")
+    parser.add_argument("--db", default="data/ohlcv.sqlite", help="SQLite 경로")
+    parser.add_argument("--csv", default="", help="CSV 경로. 여러 마켓이면 파일명에 마켓을 붙입니다.")
+    parser.add_argument("--page-sleep", type=float, default=0.15, help="페이지 사이 대기(초)")
+    parser.add_argument("--market-sleep", type=float, default=0.2, help="마켓 사이 대기(초)")
+    parser.add_argument("--max-retries", type=int, default=5)
+    parser.add_argument("--retry-delay", type=float, default=1.0)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    markets = parse_markets(args.markets)
+    if args.hours < 1:
+        raise SystemExit("hours 는 1 이상이어야 합니다.")
+    if args.unit not in {1, 3, 5, 10, 15, 30, 60, 240}:
+        raise SystemExit("unit 이 업비트 분봉 단위가 아닙니다.")
+
+    # exchange_api 가 backfill 을 import 하므로 CLI 진입 시에만 가져옵니다.
+    from exchange_api import UpbitREST
+    from logger import setup_logger
+
+    setup_logger("backfill.log", "INFO")
+    client = UpbitREST(
+        access_key="",
+        secret_key="",
+        http_timeout=10,
+        max_retries=args.max_retries,
+        retry_delay=args.retry_delay,
+        quotation_rps=8.0,
+        account_rps=15.0,
+        order_rps=6.0,
+    )
+    with CandleStore(args.db) as store:
+        results = backfill_markets(
+            client.get_ohlcv_page,
+            store,
+            markets,
+            args.unit,
+            args.hours,
+            page_sleep=args.page_sleep,
+            max_retries=args.max_retries,
+            retry_delay=args.retry_delay,
+            market_sleep=args.market_sleep,
+        )
+        if args.csv:
+            start_ms = int(time.time() * 1000) - args.hours * 3_600_000
+            written = export_markets_csv(store, markets, args.unit, args.csv, start_ms)
+            for market, rows in written.items():
+                logger.info("백필 CSV %s행 저장: %s", rows, csv_path_for_market(args.csv, market) if len(markets) > 1 else args.csv)
+
+    for market, result in results.items():
+        logger.info(
+            "백필 완료 %s | 페이지 %s | 신규 %s | 저장 %s",
+            market,
+            result.pages,
+            result.new_rows,
+            result.stored_rows,
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

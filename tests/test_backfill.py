@@ -3,7 +3,16 @@ import unittest
 from decimal import Decimal
 from pathlib import Path
 
-from backfill import CandleStore, OhlcvBar, backfill_ohlcv
+from backfill import (
+    CandleStore,
+    OhlcvBar,
+    backfill_markets,
+    backfill_ohlcv,
+    csv_path_for_market,
+    ensure_market,
+    export_markets_csv,
+    parse_markets,
+)
 
 
 def bars_from(start_ms: int, count: int) -> list[OhlcvBar]:
@@ -124,6 +133,60 @@ class BackfillTests(unittest.TestCase):
             )
             self.assertEqual(result.pages, 0)
             self.assertEqual(result.stored_rows, 0)
+            store.close()
+
+    def test_parse_markets_defaults_to_btc_and_eth(self) -> None:
+        self.assertEqual(parse_markets(""), ("USDT-BTC", "USDT-ETH"))
+        self.assertEqual(parse_markets("usdt-btc; usdt-eth,USDT-BTC"), ("USDT-BTC", "USDT-ETH"))
+        self.assertEqual(ensure_market(("USDT-ETH",), "USDT-BTC"), ("USDT-BTC", "USDT-ETH"))
+
+    def test_backfill_markets_stores_btc_and_eth(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            store = CandleStore(str(Path(folder) / "ohlcv.sqlite"))
+            now = 2_000_000_000_000
+            seen: list[str] = []
+
+            def fetch(market: str, unit: int, count: int, to: str | None) -> list[OhlcvBar]:
+                self.assertEqual(unit, 1)
+                if to is not None:
+                    return []
+                seen.append(market)
+                base = Decimal("100") if market == "USDT-BTC" else Decimal("10")
+                return [
+                    OhlcvBar(
+                        timestamp_ms=now - offset * 60_000,
+                        open_time=f"{market}-{offset}",
+                        open=base,
+                        high=base + 1,
+                        low=base - 1,
+                        close=base,
+                        volume=Decimal("1"),
+                    )
+                    for offset in range(3)
+                ]
+
+            results = backfill_markets(
+                fetch,
+                store,
+                ("USDT-BTC", "USDT-ETH"),
+                1,
+                hours=1,
+                now_ms=now,
+                page_sleep=0,
+                market_sleep=0,
+                sleep=lambda _seconds: None,
+            )
+            self.assertEqual(seen, ["USDT-BTC", "USDT-ETH"])
+            self.assertEqual(results["USDT-BTC"].stored_rows, 3)
+            self.assertEqual(results["USDT-ETH"].stored_rows, 3)
+            self.assertEqual(store.count("USDT-BTC", 1), 3)
+            self.assertEqual(store.count("USDT-ETH", 1), 3)
+            csv_root = str(Path(folder) / "ohlcv.csv")
+            written = export_markets_csv(store, ("USDT-BTC", "USDT-ETH"), 1, csv_root)
+            self.assertEqual(written["USDT-BTC"], 3)
+            self.assertEqual(written["USDT-ETH"], 3)
+            self.assertTrue(Path(csv_path_for_market(csv_root, "USDT-BTC")).exists())
+            self.assertTrue(Path(csv_path_for_market(csv_root, "USDT-ETH")).exists())
             store.close()
 
 
