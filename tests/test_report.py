@@ -46,7 +46,6 @@ class ReportTests(unittest.TestCase):
             minute.mkdir()
             daily.mkdir()
             rows = ["timestamp_ms,open_time,open,high,low,close,volume"]
-            # 140 bars so atr=14 and lookback=120 fit
             for index in range(140):
                 stamp = 1_700_000_000_000 + index * 60_000
                 close = 100 + (index % 7)

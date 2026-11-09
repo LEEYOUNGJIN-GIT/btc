@@ -244,7 +244,6 @@ def close_correlation(left: Sequence[OhlcvBar], right: Sequence[OhlcvBar]) -> De
     var_y = sum(((p[1] - mean_y) ** 2 for p in pairs), Decimal("0"))
     if var_x <= 0 or var_y <= 0:
         return None
-    # Decimal sqrt
     return cov / (var_x * var_y).sqrt()
 
 

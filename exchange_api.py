@@ -982,7 +982,6 @@ class DryRunExchange:
     ) -> Order:
         cancelled = self.cancel(order_uuid)
         if cancelled.executed_volume > 0 and cancelled.remaining_volume == 0 and not cancelled.is_open:
-            # cancel() zeros remaining. Partial fill keeps executed_volume.
             if cancelled.executed_volume >= cancelled.volume:
                 return cancelled
         if cancelled.executed_volume > 0:
@@ -1159,17 +1158,3 @@ def build_exchange(cfg: Any, market_data: Any = None) -> Any:
             )
         return DryRunExchange(cfg, source)
     return UpbitExchange(cfg)
-
-
-# 시세 전용 객체도 테스트에서 교체할 수 있게 노출합니다.
-def public_client(cfg: Any) -> UpbitREST:
-    return UpbitREST(
-        access_key=cfg.access_key,
-        secret_key=cfg.secret_key,
-        http_timeout=cfg.http_timeout,
-        max_retries=cfg.max_retries,
-        retry_delay=cfg.retry_delay_sec,
-        quotation_rps=cfg.quotation_rps,
-        account_rps=cfg.account_rps,
-        order_rps=cfg.order_rps,
-    )

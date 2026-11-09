@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Sequence
 
-from analyzer import DynamicLevels, analyze, grid_buy_price, grid_sell_price
+from analyzer import DynamicLevels, analyze, grid_sell_price
 from backfill import OhlcvBar
 from strategy import align_price
 
@@ -97,7 +97,6 @@ def compute_scalping_zone(
     else:
         daily_pos = (daily.last_close - daily.support) / daily_span
 
-    # 일봉 필터: 지지 이탈·상단 과열이면 스캘핑 회피.
     if daily.last_close < daily.support * (Decimal("1") - breakdown_buffer):
         bias, actionable, reason = "avoid", False, "일봉 지지 이탈"
     elif daily_pos >= Decimal("0.85") and daily.last_close < sma:
@@ -116,21 +115,18 @@ def compute_scalping_zone(
         raise ValueError("분봉 박스가 비어 있습니다.")
     zone_low = minute.support
     zone_high = minute.support + minute_span * entry_zone
-    # 일봉 지지를 하드 플로어로 올리되, 진입 밴드를 닫아버리지는 않습니다.
     floor = daily.support * (Decimal("1") - breakdown_buffer)
     if zone_low < floor < zone_high:
         zone_low = floor
     if zone_high <= zone_low:
         zone_high = zone_low * (Decimal("1") + max(min_grid_rate, Decimal("0.001")))
 
-    # 목표 간격: 분봉 그리드 기본, 일봉 ATR 이 크면 상단으로 가산(여전히 max 클립).
     blended_raw = max(minute.grid_rate, min(daily.atr_rate / Decimal("8"), max_grid_rate))
     target_rate = _clip(blended_raw, min_grid_rate, max_grid_rate)
     fee_floor = buy_fee_rate + sell_fee_rate + Decimal("0.0001")
     if target_rate < fee_floor:
         target_rate = min(max(fee_floor, min_grid_rate), max_grid_rate)
 
-    # 중립이면 목표를 수수료+알파에 가깝게 줄여 과도한 대기 매도를 피합니다.
     if bias == "neutral" and actionable:
         target_rate = max(fee_floor, min(target_rate, (min_grid_rate + max_grid_rate) / 2))
 
@@ -170,18 +166,3 @@ def compute_scalping_zone(
         daily_sma=sma,
         blended=blended,
     )
-
-
-def suggest_limit_buy(
-    zone: ScalpingZone,
-    best_bid: Decimal,
-    best_ask: Decimal,
-) -> Decimal | None:
-    """스캘핑 구간이 actionable 일 때만 분봉 그리드 매수가를 제안합니다."""
-    if not zone.actionable:
-        return None
-    if best_bid <= 0 or best_ask <= best_bid:
-        return None
-    if best_bid > zone.zone_high:
-        return None
-    return grid_buy_price(best_bid, best_ask, zone.zone_low, zone.target_rate)

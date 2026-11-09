@@ -928,8 +928,6 @@ class RoundTripBot:
                     zone.reason,
                     float(zone.daily_position * 100),
                 )
-                # 회피 구간에서는 분봉 박스만 유지하되 그리드는 블렌드값을 씁니다.
-                levels = zone.blended
         else:
             self.scalping_zone = None
         self.strategy.update_levels(levels)

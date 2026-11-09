@@ -191,12 +191,6 @@ class Strategy:
             return self.levels.support, self.levels.resistance, self.levels.grid_rate
         return snapshot.box_low, snapshot.box_high, self.params.buy_offset_rate
 
-    def position_in_box(self, snapshot: MarketSnapshot) -> Decimal:
-        span = snapshot.box_high - snapshot.box_low
-        if span <= 0:
-            return Decimal("1")
-        return (snapshot.trade_price - snapshot.box_low) / span
-
     def plan_buy(self, snapshot: MarketSnapshot, quote_balance: Decimal) -> Decision:
         """하단 구간에서만, 가용 USDT 로 살 수 있는 지정가 매수 계획을 만듭니다."""
         if snapshot.trade_price <= 0 or snapshot.best_bid <= 0 or snapshot.best_ask <= 0:
