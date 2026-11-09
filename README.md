@@ -88,7 +88,6 @@ python report.py
 
 봇은 `MULTI_TF_ENABLED=true` 이면 분봉 백필과 `data/daily/ohlcv_{MARKET}.csv` 를 같이 보고
 스캘핑 구간(`scalp_zone`)을 갱신합니다. `actionable=false` 이면 신규 매수를 건너뜁니다.
-```
 
 일봉만 / 분봉만:
 
