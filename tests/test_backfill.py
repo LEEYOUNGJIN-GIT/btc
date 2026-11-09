@@ -4,6 +4,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from backfill import (
+    DAY_UNIT,
     CandleStore,
     OhlcvBar,
     backfill_markets,
@@ -187,6 +188,45 @@ class BackfillTests(unittest.TestCase):
             self.assertEqual(written["USDT-ETH"], 3)
             self.assertTrue(Path(csv_path_for_market(csv_root, "USDT-BTC")).exists())
             self.assertTrue(Path(csv_path_for_market(csv_root, "USDT-ETH")).exists())
+            store.close()
+
+    def test_daily_backfill_uses_day_unit(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            store = CandleStore(str(Path(folder) / "daily.sqlite"))
+            now = 1_700_000_000_000
+            units: list[int] = []
+
+            def fetch(market: str, unit: int, count: int, to: str | None) -> list[OhlcvBar]:
+                units.append(unit)
+                if to is not None:
+                    return []
+                return [
+                    OhlcvBar(
+                        timestamp_ms=now - offset * 86_400_000,
+                        open_time=f"2024-01-{offset + 1:02d}T00:00:00",
+                        open=Decimal("1"),
+                        high=Decimal("2"),
+                        low=Decimal("0.5"),
+                        close=Decimal("1.5"),
+                        volume=Decimal("10"),
+                    )
+                    for offset in range(5)
+                ]
+
+            result = backfill_ohlcv(
+                fetch,
+                store,
+                "USDT-BTC",
+                unit=1,
+                days=5,
+                now_ms=now,
+                page_sleep=0,
+                sleep=lambda _seconds: None,
+            )
+            self.assertTrue(units)
+            self.assertTrue(all(value == DAY_UNIT for value in units))
+            self.assertEqual(result.stored_rows, 5)
+            self.assertEqual(store.count("USDT-BTC", DAY_UNIT), 5)
             store.close()
 
 

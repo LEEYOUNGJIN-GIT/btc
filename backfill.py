@@ -1,11 +1,10 @@
-"""업비트 분봉을 페이지 단위로 받아 SQLite 에 쌓습니다.
+"""업비트 분봉·일봉을 페이지 단위로 받아 SQLite/CSV 에 쌓습니다.
 
-캔들 REST 는 한 번에 최대 200개입니다. 24시간~7일치는 여러 번 나눠 받고,
-이미 저장한 시각은 다시 끝까지 당기지 않습니다. 요청 사이에는 쉬고,
-오류가 나면 지수 간격으로 재시도합니다.
+캔들 REST 는 한 번에 최대 200개입니다. 이미 저장한 시각은 다시 끝까지
+당기지 않습니다. 요청 사이에는 쉬고, 오류가 나면 지수 간격으로 재시도합니다.
 
-기본 대상은 USDT-BTC 와 USDT-ETH 입니다. `python backfill.py` 로
-봇 없이 공개 시세만 받아 저장할 수 있습니다.
+봇 동적 단가는 최근 분봉을 쓰고, GitHub 적재용 장기 히스토리는 UTC 일봉을
+씁니다. `python backfill.py` 기본값은 USDT-BTC·USDT-ETH 최근 5년 일봉입니다.
 """
 
 from __future__ import annotations
@@ -26,6 +25,13 @@ from logger import get_logger
 logger = get_logger()
 
 DEFAULT_BACKFILL_MARKETS = ("USDT-BTC", "USDT-ETH")
+# SQLite unit 컬럼에 넣는 일봉 표식. 업비트 분봉 unit 과 겹치지 않습니다.
+DAY_UNIT = 1440
+# GitHub 적재용 권고: 5년 일봉(~3.6k행/마켓). 디스크·PR 모두 작습니다.
+DEFAULT_DAILY_DAYS = 1825
+MAX_DAILY_DAYS = 3650
+DEFAULT_DAILY_CSV = "data/daily/ohlcv.csv"
+DEFAULT_DAILY_DB = "data/daily/ohlcv.sqlite"
 
 PageFetcher = Callable[[str, int, int, str | None], Sequence["OhlcvBar"]]
 
@@ -235,8 +241,9 @@ def backfill_ohlcv(
     store: CandleStore,
     market: str,
     unit: int,
-    hours: int,
+    hours: int = 0,
     *,
+    days: int | None = None,
     now_ms: int | None = None,
     page_size: int = 200,
     page_sleep: float = 0.15,
@@ -244,15 +251,30 @@ def backfill_ohlcv(
     retry_delay: float = 1.0,
     sleep: Callable[[float], None] = time.sleep,
 ) -> BackfillResult:
-    """start 시각까지 분봉을 채웁니다. 이미 있는 구간은 겹치는 순간 멈춥니다."""
-    if hours < 1:
-        raise ValueError("백필 기간은 1시간 이상이어야 합니다.")
-    if unit <= 0 or page_size <= 0:
-        raise ValueError("분봉 단위와 페이지 크기는 0보다 커야 합니다.")
+    """start 시각까지 캔들을 채웁니다. 이미 있는 구간은 겹치는 순간 멈춥니다.
+
+    days 를 주면 UTC 일봉(DAY_UNIT)으로 받고, 아니면 분봉(hours)으로 받습니다.
+    """
+    if page_size <= 0:
+        raise ValueError("페이지 크기는 0보다 커야 합니다.")
+    if days is not None:
+        if not 1 <= days <= MAX_DAILY_DAYS:
+            raise ValueError(f"일봉 백필 기간은 1~{MAX_DAILY_DAYS}일입니다.")
+        unit = DAY_UNIT
+        span_ms = days * 86_400_000
+        max_pages = days // page_size + 3
+        label = "일"
+    else:
+        if hours < 1:
+            raise ValueError("백필 기간은 1시간 이상이어야 합니다.")
+        if unit <= 0:
+            raise ValueError("분봉 단위는 0보다 커야 합니다.")
+        span_ms = hours * 3_600_000
+        max_pages = (hours * 60) // (unit * page_size) + 3
+        label = f"{unit}분"
     now = int(time.time() * 1000) if now_ms is None else now_ms
-    start_ms = now - hours * 3_600_000
+    start_ms = now - span_ms
     prior_min, prior_max, _prior_count = store.coverage(market, unit)
-    max_pages = (hours * 60) // (unit * page_size) + 3
     cursor: str | None = None
     seen_oldest: int | None = None
     pages = 0
@@ -281,10 +303,10 @@ def backfill_ohlcv(
         new_rows += added
         pages += 1
         logger.info(
-            "백필 페이지 %s | %s %s분 | %s ~ %s | 신규 %s",
+            "백필 페이지 %s | %s %s | %s ~ %s | 신규 %s",
             pages,
             market,
-            unit,
+            label,
             ordered[0].open_time,
             ordered[-1].open_time,
             added,
@@ -312,8 +334,9 @@ def backfill_markets(
     store: CandleStore,
     markets: Sequence[str],
     unit: int,
-    hours: int,
+    hours: int = 0,
     *,
+    days: int | None = None,
     now_ms: int | None = None,
     page_size: int = 200,
     page_sleep: float = 0.15,
@@ -333,6 +356,7 @@ def backfill_markets(
             market,
             unit,
             hours,
+            days=days,
             now_ms=now_ms,
             page_size=page_size,
             page_sleep=page_sleep,
@@ -428,16 +452,34 @@ def parse_upbit_candle(row: dict) -> OhlcvBar:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="업비트 USDT-BTC·USDT-ETH 분봉 백필")
+    parser = argparse.ArgumentParser(
+        description="업비트 USDT-BTC·USDT-ETH 캔들 백필 (기본: UTC 일봉 5년, GitHub data/daily/)"
+    )
     parser.add_argument(
         "--markets",
         default=",".join(DEFAULT_BACKFILL_MARKETS),
         help="콤마로 구분한 마켓. 기본 USDT-BTC,USDT-ETH",
     )
-    parser.add_argument("--hours", type=int, default=24, help="최근 몇 시간을 채울지")
-    parser.add_argument("--unit", type=int, default=1, help="분봉 단위")
-    parser.add_argument("--db", default="data/ohlcv.sqlite", help="SQLite 경로")
-    parser.add_argument("--csv", default="", help="CSV 경로. 여러 마켓이면 파일명에 마켓을 붙입니다.")
+    parser.add_argument(
+        "--timeframe",
+        choices=("day", "minute"),
+        default="day",
+        help="day=UTC 일봉(기본, GitHub 적재), minute=봇용 분봉",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=DEFAULT_DAILY_DAYS,
+        help=f"일봉 기간(UTC). 권고 기본 {DEFAULT_DAILY_DAYS}일(~5년), 최대 {MAX_DAILY_DAYS}",
+    )
+    parser.add_argument("--hours", type=int, default=24, help="분봉일 때 최근 몇 시간")
+    parser.add_argument("--unit", type=int, default=1, help="분봉 단위(timeframe=minute)")
+    parser.add_argument("--db", default="", help="SQLite 경로. 비우면 timeframe 기본 경로")
+    parser.add_argument(
+        "--csv",
+        default="",
+        help="CSV 경로. day 기본은 data/daily/ohlcv.csv. 여러 마켓이면 파일명에 마켓을 붙입니다.",
+    )
     parser.add_argument("--page-sleep", type=float, default=0.15, help="페이지 사이 대기(초)")
     parser.add_argument("--market-sleep", type=float, default=0.2, help="마켓 사이 대기(초)")
     parser.add_argument("--max-retries", type=int, default=5)
@@ -448,10 +490,27 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     markets = parse_markets(args.markets)
-    if args.hours < 1:
-        raise SystemExit("hours 는 1 이상이어야 합니다.")
-    if args.unit not in {1, 3, 5, 10, 15, 30, 60, 240}:
-        raise SystemExit("unit 이 업비트 분봉 단위가 아닙니다.")
+    daily = args.timeframe == "day"
+    if daily:
+        if not 1 <= args.days <= MAX_DAILY_DAYS:
+            raise SystemExit(f"days 는 1~{MAX_DAILY_DAYS} 이어야 합니다.")
+        unit = DAY_UNIT
+        days: int | None = args.days
+        hours = 0
+        db_path = args.db or DEFAULT_DAILY_DB
+        csv_path = args.csv if args.csv != "" else DEFAULT_DAILY_CSV
+        span_ms = args.days * 86_400_000
+    else:
+        if args.hours < 1:
+            raise SystemExit("hours 는 1 이상이어야 합니다.")
+        if args.unit not in {1, 3, 5, 10, 15, 30, 60, 240}:
+            raise SystemExit("unit 이 업비트 분봉 단위가 아닙니다.")
+        unit = args.unit
+        days = None
+        hours = args.hours
+        db_path = args.db or "data/ohlcv.sqlite"
+        csv_path = args.csv
+        span_ms = args.hours * 3_600_000
 
     # exchange_api 가 backfill 을 import 하므로 CLI 진입 시에만 가져옵니다.
     from exchange_api import UpbitREST
@@ -468,23 +527,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         account_rps=15.0,
         order_rps=6.0,
     )
-    with CandleStore(args.db) as store:
+    with CandleStore(db_path) as store:
         results = backfill_markets(
             client.get_ohlcv_page,
             store,
             markets,
-            args.unit,
-            args.hours,
+            unit,
+            hours,
+            days=days,
             page_sleep=args.page_sleep,
             max_retries=args.max_retries,
             retry_delay=args.retry_delay,
             market_sleep=args.market_sleep,
         )
-        if args.csv:
-            start_ms = int(time.time() * 1000) - args.hours * 3_600_000
-            written = export_markets_csv(store, markets, args.unit, args.csv, start_ms)
+        if csv_path:
+            start_ms = int(time.time() * 1000) - span_ms
+            written = export_markets_csv(store, markets, unit, csv_path, start_ms)
             for market, rows in written.items():
-                logger.info("백필 CSV %s행 저장: %s", rows, csv_path_for_market(args.csv, market) if len(markets) > 1 else args.csv)
+                out = csv_path_for_market(csv_path, market) if len(markets) > 1 else csv_path
+                logger.info("백필 CSV %s행 저장: %s", rows, out)
 
     for market, result in results.items():
         logger.info(
