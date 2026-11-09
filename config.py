@@ -102,6 +102,9 @@ class AppConfig:
     resistance_percentile: Decimal = Decimal("0.90")
     analyze_refresh_sec: float = 60
     dynamic_reprice_sec: float = 15
+    multi_tf_enabled: bool = True
+    daily_data_dir: str = "data/daily"
+    daily_sma_period: int = 20
 
     @property
     def quote(self) -> str:
@@ -158,6 +161,8 @@ class AppConfig:
             raise ValueError("분석 갱신 주기가 올바르지 않습니다.")
         if self.backfill_page_sleep < 0:
             raise ValueError("BACKFILL_PAGE_SLEEP 는 0 이상이어야 합니다.")
+        if self.daily_sma_period < 2:
+            raise ValueError("DAILY_SMA_PERIOD 는 2 이상이어야 합니다.")
         if not self.backfill_markets:
             raise ValueError("BACKFILL_MARKETS 가 비어 있습니다.")
         for market in self.backfill_markets:
@@ -264,6 +269,9 @@ def load_config() -> AppConfig:
         resistance_percentile=_decimal("RESISTANCE_PERCENTILE", "0.90"),
         analyze_refresh_sec=float(_text("ANALYZE_REFRESH_SEC", "60")),
         dynamic_reprice_sec=float(_text("DYNAMIC_REPRICE_SEC", "15")),
+        multi_tf_enabled=_bool("MULTI_TF_ENABLED", True),
+        daily_data_dir=_text("DAILY_DATA_DIR", "data/daily"),
+        daily_sma_period=_int("DAILY_SMA_PERIOD", 20),
     )
     config.validate()
     return config

@@ -34,7 +34,8 @@
 | `config.py` | `.env` 설정. 백필 기간·그리드 범위 포함 |
 | `exchange_api.py` | 잔고, 시세, 분봉 페이지, 주문, 현재가 WebSocket |
 | `backfill.py` | 일봉 5년 + 분봉 7일 GitHub CSV 수집 CLI (`--timeframe bundle`) |
-| `report.py` | `data/minute`·`data/daily` 를 ATR/박스/그리드·수익률·낙폭으로 분석 |
+| `report.py` | `data/minute`·`data/daily` 분석 + 멀티TF 스캘핑 구간 |
+| `scalp_zone.py` | 분봉+일봉 지표로 진입 구간·목표·손절·허용 여부 산출 |
 | `data/daily/` | BTC·ETH UTC 일봉 CSV (권고 5년) |
 | `data/minute/` | BTC·ETH UTC 1분봉 CSV (권고 7일, analyzer 동일 지표) |
 | `data/reports/` | `report.py` 결과 JSON/Markdown |
@@ -82,7 +83,11 @@ python -m unittest discover -s tests -v
 python backfill.py
 # == --timeframe bundle (data/daily + data/minute)
 python report.py
-# data/reports/analysis.json , analysis.md
+# data/reports/analysis.json , analysis.md (스캘핑 구간 포함)
+```
+
+봇은 `MULTI_TF_ENABLED=true` 이면 분봉 백필과 `data/daily/ohlcv_{MARKET}.csv` 를 같이 보고
+스캘핑 구간(`scalp_zone`)을 갱신합니다. `actionable=false` 이면 신규 매수를 건너뜁니다.
 ```
 
 일봉만 / 분봉만:

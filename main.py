@@ -18,8 +18,16 @@ from decimal import Decimal
 from pathlib import Path
 
 from analyzer import analyze, bars_are_stale, closed_bars
-from backfill import CandleStore, backfill_markets, backfill_ohlcv, csv_path_for_market, export_markets_csv
+from backfill import (
+    CandleStore,
+    backfill_markets,
+    backfill_ohlcv,
+    csv_path_for_market,
+    export_markets_csv,
+    load_ohlcv_csv,
+)
 from config import AppConfig, load_config
+from scalp_zone import ScalpingZone, compute_scalping_zone
 from exchange_api import (
     NullFeed,
     Order,
@@ -85,6 +93,7 @@ class RoundTripBot:
         self._halt_logged = False
         self._started = time.monotonic()
         self._levels_monotonic = 0.0
+        self.scalping_zone: ScalpingZone | None = None
         self._once_key = ""
 
     def request_stop(self) -> None:
@@ -232,6 +241,11 @@ class RoundTripBot:
             self._save()
             return
         if time.time() < self.cooldown_until:
+            return
+        if self.scalping_zone is not None and not self.scalping_zone.actionable:
+            self._log_skip(
+                f"멀티TF 스캘핑 비활성({self.scalping_zone.bias}): {self.scalping_zone.reason}"
+            )
             return
         decision = self.strategy.plan_buy(snapshot, self.exchange.quote_available())
         if decision.plan is None:
@@ -902,6 +916,22 @@ class RoundTripBot:
             support_percentile=self.cfg.support_percentile,
             resistance_percentile=self.cfg.resistance_percentile,
         )
+        zone = self._multi_tf_zone(usable)
+        if zone is not None:
+            self.scalping_zone = zone
+            if zone.actionable:
+                levels = zone.blended
+            else:
+                logger.info(
+                    "멀티TF 스캘핑 보류 | bias=%s | %s | 일봉위치 %.1f%%",
+                    zone.bias,
+                    zone.reason,
+                    float(zone.daily_position * 100),
+                )
+                # 회피 구간에서는 분봉 박스만 유지하되 그리드는 블렌드값을 씁니다.
+                levels = zone.blended
+        else:
+            self.scalping_zone = None
         self.strategy.update_levels(levels)
         logger.info(
             "동적 단가 | 그리드 %.3f%% | ATR %.3f%% | 평균 고저폭 %.3f%% | 박스 %s~%s | 표본 %s",
@@ -912,6 +942,48 @@ class RoundTripBot:
             to_plain_str(levels.resistance),
             levels.sample_size,
         )
+        if self.scalping_zone is not None:
+            zone = self.scalping_zone
+            logger.info(
+                "스캘핑 구간 | %s | actionable=%s | %s~%s | 목표 %.3f%% | 손절 %.3f%% | %s",
+                zone.bias,
+                zone.actionable,
+                to_plain_str(zone.zone_low),
+                to_plain_str(zone.zone_high),
+                float(zone.target_rate * 100),
+                float(zone.stop_rate * 100),
+                zone.reason,
+            )
+
+    def _multi_tf_zone(self, minute_bars: list) -> ScalpingZone | None:
+        if not self.cfg.multi_tf_enabled:
+            return None
+        daily_path = Path(self.cfg.daily_data_dir) / f"ohlcv_{self.cfg.market}.csv"
+        if not daily_path.is_file():
+            logger.info("일봉 CSV 없음(%s). 분봉 단독 동적 단가를 씁니다.", daily_path)
+            return None
+        try:
+            daily_bars = load_ohlcv_csv(str(daily_path))
+            return compute_scalping_zone(
+                minute_bars,
+                daily_bars,
+                market=self.cfg.market,
+                buy_fee_rate=self.strategy.params.buy_fee_rate,
+                sell_fee_rate=self.strategy.params.sell_fee_rate,
+                atr_period=self.cfg.atr_period,
+                range_lookback=self.cfg.range_lookback,
+                min_grid_rate=self.cfg.min_grid_rate,
+                max_grid_rate=self.cfg.max_grid_rate,
+                support_percentile=self.cfg.support_percentile,
+                resistance_percentile=self.cfg.resistance_percentile,
+                entry_zone=self.cfg.entry_zone,
+                breakdown_buffer=self.cfg.breakdown_buffer,
+                stop_loss_rate=self.cfg.stop_loss_rate,
+                daily_sma_period=self.cfg.daily_sma_period,
+            )
+        except Exception:
+            logger.exception("멀티TF 스캘핑 구간 산출 실패. 분봉 단독으로 진행합니다.")
+            return None
 
     def _log_pricing(self) -> None:
         sample = self.strategy.min_sell_price(Decimal("100"))
