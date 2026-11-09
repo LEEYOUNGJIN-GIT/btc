@@ -18,8 +18,16 @@ from decimal import Decimal
 from pathlib import Path
 
 from analyzer import analyze, bars_are_stale, closed_bars
-from backfill import CandleStore, backfill_ohlcv
+from backfill import (
+    CandleStore,
+    backfill_markets,
+    backfill_ohlcv,
+    csv_path_for_market,
+    export_markets_csv,
+    load_ohlcv_csv,
+)
 from config import AppConfig, load_config
+from scalp_zone import ScalpingZone, compute_scalping_zone
 from exchange_api import (
     NullFeed,
     Order,
@@ -85,6 +93,7 @@ class RoundTripBot:
         self._halt_logged = False
         self._started = time.monotonic()
         self._levels_monotonic = 0.0
+        self.scalping_zone: ScalpingZone | None = None
         self._once_key = ""
 
     def request_stop(self) -> None:
@@ -232,6 +241,11 @@ class RoundTripBot:
             self._save()
             return
         if time.time() < self.cooldown_until:
+            return
+        if self.scalping_zone is not None and not self.scalping_zone.actionable:
+            self._log_skip(
+                f"멀티TF 스캘핑 비활성({self.scalping_zone.bias}): {self.scalping_zone.reason}"
+            )
             return
         decision = self.strategy.plan_buy(snapshot, self.exchange.quote_available())
         if decision.plan is None:
@@ -818,40 +832,65 @@ class RoundTripBot:
         if not force and now - self._levels_monotonic < self.cfg.analyze_refresh_sec:
             return
         try:
-            self._refresh_dynamic_levels()
+            self._refresh_dynamic_levels(warm_all=force)
         except Exception:
             logger.exception("동적 단가 갱신 실패. 마지막 산출값 또는 고정 간격을 유지합니다.")
         finally:
             self._levels_monotonic = now
 
-    def _refresh_dynamic_levels(self) -> None:
+    def _refresh_dynamic_levels(self, *, warm_all: bool = False) -> None:
         start_ms = int(time.time() * 1000) - self.cfg.backfill_hours * 3_600_000
+        targets = self.cfg.backfill_markets if warm_all else (self.cfg.market,)
         with CandleStore(self.cfg.backfill_db) as store:
-            result = backfill_ohlcv(
-                self.exchange.get_ohlcv_page,
-                store,
-                self.cfg.market,
-                self.cfg.backfill_unit,
-                self.cfg.backfill_hours,
-                page_sleep=self.cfg.backfill_page_sleep,
-                max_retries=self.cfg.max_retries,
-                retry_delay=self.cfg.retry_delay_sec,
-            )
+            if len(targets) == 1:
+                results = {
+                    targets[0]: backfill_ohlcv(
+                        self.exchange.get_ohlcv_page,
+                        store,
+                        targets[0],
+                        self.cfg.backfill_unit,
+                        self.cfg.backfill_hours,
+                        page_sleep=self.cfg.backfill_page_sleep,
+                        max_retries=self.cfg.max_retries,
+                        retry_delay=self.cfg.retry_delay_sec,
+                    )
+                }
+            else:
+                results = backfill_markets(
+                    self.exchange.get_ohlcv_page,
+                    store,
+                    targets,
+                    self.cfg.backfill_unit,
+                    self.cfg.backfill_hours,
+                    page_sleep=self.cfg.backfill_page_sleep,
+                    max_retries=self.cfg.max_retries,
+                    retry_delay=self.cfg.retry_delay_sec,
+                    market_sleep=self.cfg.backfill_page_sleep,
+                )
             bars = store.load(self.cfg.market, self.cfg.backfill_unit, start_ms)
             if self.cfg.backfill_csv:
-                written = store.export_csv(
-                    self.cfg.market,
+                written = export_markets_csv(
+                    store,
+                    targets,
                     self.cfg.backfill_unit,
                     self.cfg.backfill_csv,
                     start_ms,
                 )
-                logger.info("백필 CSV %s행 저장: %s", written, self.cfg.backfill_csv)
-        logger.info(
-            "백필 완료 | 페이지 %s | 신규 %s | 저장 %s",
-            result.pages,
-            result.new_rows,
-            result.stored_rows,
-        )
+                for market, rows in written.items():
+                    path = (
+                        csv_path_for_market(self.cfg.backfill_csv, market)
+                        if len(targets) > 1
+                        else self.cfg.backfill_csv
+                    )
+                    logger.info("백필 CSV %s행 저장: %s", rows, path)
+        for market, result in results.items():
+            logger.info(
+                "백필 완료 %s | 페이지 %s | 신규 %s | 저장 %s",
+                market,
+                result.pages,
+                result.new_rows,
+                result.stored_rows,
+            )
         now_ms = int(time.time() * 1000)
         if bars_are_stale(bars, self.cfg.backfill_unit, now_ms):
             logger.warning(
@@ -877,6 +916,20 @@ class RoundTripBot:
             support_percentile=self.cfg.support_percentile,
             resistance_percentile=self.cfg.resistance_percentile,
         )
+        zone = self._multi_tf_zone(usable)
+        if zone is not None:
+            self.scalping_zone = zone
+            if zone.actionable:
+                levels = zone.blended
+            else:
+                logger.info(
+                    "멀티TF 스캘핑 보류 | bias=%s | %s | 일봉위치 %.1f%%",
+                    zone.bias,
+                    zone.reason,
+                    float(zone.daily_position * 100),
+                )
+        else:
+            self.scalping_zone = None
         self.strategy.update_levels(levels)
         logger.info(
             "동적 단가 | 그리드 %.3f%% | ATR %.3f%% | 평균 고저폭 %.3f%% | 박스 %s~%s | 표본 %s",
@@ -887,6 +940,48 @@ class RoundTripBot:
             to_plain_str(levels.resistance),
             levels.sample_size,
         )
+        if self.scalping_zone is not None:
+            zone = self.scalping_zone
+            logger.info(
+                "스캘핑 구간 | %s | actionable=%s | %s~%s | 목표 %.3f%% | 손절 %.3f%% | %s",
+                zone.bias,
+                zone.actionable,
+                to_plain_str(zone.zone_low),
+                to_plain_str(zone.zone_high),
+                float(zone.target_rate * 100),
+                float(zone.stop_rate * 100),
+                zone.reason,
+            )
+
+    def _multi_tf_zone(self, minute_bars: list) -> ScalpingZone | None:
+        if not self.cfg.multi_tf_enabled:
+            return None
+        daily_path = Path(self.cfg.daily_data_dir) / f"ohlcv_{self.cfg.market}.csv"
+        if not daily_path.is_file():
+            logger.info("일봉 CSV 없음(%s). 분봉 단독 동적 단가를 씁니다.", daily_path)
+            return None
+        try:
+            daily_bars = load_ohlcv_csv(str(daily_path))
+            return compute_scalping_zone(
+                minute_bars,
+                daily_bars,
+                market=self.cfg.market,
+                buy_fee_rate=self.strategy.params.buy_fee_rate,
+                sell_fee_rate=self.strategy.params.sell_fee_rate,
+                atr_period=self.cfg.atr_period,
+                range_lookback=self.cfg.range_lookback,
+                min_grid_rate=self.cfg.min_grid_rate,
+                max_grid_rate=self.cfg.max_grid_rate,
+                support_percentile=self.cfg.support_percentile,
+                resistance_percentile=self.cfg.resistance_percentile,
+                entry_zone=self.cfg.entry_zone,
+                breakdown_buffer=self.cfg.breakdown_buffer,
+                stop_loss_rate=self.cfg.stop_loss_rate,
+                daily_sma_period=self.cfg.daily_sma_period,
+            )
+        except Exception:
+            logger.exception("멀티TF 스캘핑 구간 산출 실패. 분봉 단독으로 진행합니다.")
+            return None
 
     def _log_pricing(self) -> None:
         sample = self.strategy.min_sell_price(Decimal("100"))

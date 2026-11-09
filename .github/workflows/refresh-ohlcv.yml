@@ -1,0 +1,50 @@
+# 봇이 꺼져 있어도 GitHub 적재 OHLCV·리포트를 최신으로 유지합니다.
+# 공개 시세만 사용 (API 키 불필요). cron 은 UTC.
+name: Refresh OHLCV
+
+on:
+  schedule:
+    # 매일 00:15 UTC ≈ KST 09:15. 일봉 마감 직후·분봉 7일을 한 번에 갱신.
+    - cron: "15 0 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: refresh-ohlcv
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Backfill daily + minute CSV
+        run: python backfill.py --timeframe bundle --page-sleep 0.12 --market-sleep 0.15
+
+      - name: Build scalping report
+        run: python report.py
+
+      - name: Commit refreshed data
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: refresh UTC OHLCV and scalping report"
+          file_pattern: |
+            data/daily/*.csv
+            data/minute/*.csv
+            data/reports/*
+          commit_user_name: github-actions[bot]
+          commit_user_email: github-actions[bot]@users.noreply.github.com

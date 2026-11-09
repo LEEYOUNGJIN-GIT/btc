@@ -6,9 +6,22 @@ __pycache__/
 .pytest_cache/
 trading.log
 trading.log.*
+backfill.log
+backfill.log.*
+report.log
+report.log.*
 position_state.json
 *.tmp
-data/
+# 런타임 SQLite 제외. GitHub 적재: daily / minute / reports CSV·JSON·MD
+data/*
+!data/daily/
+!data/daily/**
+!data/minute/
+!data/minute/**
+!data/reports/
+!data/reports/**
+data/**/*.sqlite
+data/**/*.sqlite-*
 *.sqlite
 *.sqlite-journal
 *.sqlite-wal

@@ -93,6 +93,7 @@ class AppConfig:
     backfill_db: str = "data/ohlcv.sqlite"
     backfill_csv: str = ""
     backfill_page_sleep: float = 0.15
+    backfill_markets: tuple[str, ...] = ("USDT-BTC", "USDT-ETH")
     atr_period: int = 14
     range_lookback: int = 120
     min_grid_rate: Decimal = Decimal("0.002")
@@ -101,6 +102,9 @@ class AppConfig:
     resistance_percentile: Decimal = Decimal("0.90")
     analyze_refresh_sec: float = 60
     dynamic_reprice_sec: float = 15
+    multi_tf_enabled: bool = True
+    daily_data_dir: str = "data/daily"
+    daily_sma_period: int = 20
 
     @property
     def quote(self) -> str:
@@ -157,6 +161,18 @@ class AppConfig:
             raise ValueError("분석 갱신 주기가 올바르지 않습니다.")
         if self.backfill_page_sleep < 0:
             raise ValueError("BACKFILL_PAGE_SLEEP 는 0 이상이어야 합니다.")
+        if self.daily_sma_period < 2:
+            raise ValueError("DAILY_SMA_PERIOD 는 2 이상이어야 합니다.")
+        if not self.backfill_markets:
+            raise ValueError("BACKFILL_MARKETS 가 비어 있습니다.")
+        for market in self.backfill_markets:
+            parts = market.split("-")
+            if len(parts) != 2 or not parts[0] or not parts[1]:
+                raise ValueError(f"BACKFILL_MARKETS 항목이 올바르지 않습니다: {market}")
+            if parts[0] != "USDT":
+                raise ValueError("BACKFILL_MARKETS 는 USDT 마켓만 지원합니다.")
+        if self.market not in self.backfill_markets:
+            raise ValueError("MARKET 은 BACKFILL_MARKETS 에 포함되어야 합니다.")
         StrategyParams(
             buy_fee_rate=self.buy_fee_rate,
             sell_fee_rate=self.sell_fee_rate,
@@ -177,14 +193,31 @@ class AppConfig:
                 raise ValueError("실전 주문은 LIVE_TRADING_CONFIRM=YES 일 때만 허용됩니다.")
 
 
+def _markets(name: str, default: str) -> tuple[str, ...]:
+    value = _text(name, default)
+    markets: list[str] = []
+    seen: set[str] = set()
+    for part in value.replace(";", ",").split(","):
+        market = part.strip().upper()
+        if not market or market in seen:
+            continue
+        seen.add(market)
+        markets.append(market)
+    return tuple(markets)
+
+
 def load_config() -> AppConfig:
     root = Path(__file__).resolve().parent
     load_dotenv(root / ".env")
     load_dotenv()
+    market = _text("MARKET", "USDT-BTC").upper()
+    backfill_markets = _markets("BACKFILL_MARKETS", "USDT-BTC,USDT-ETH")
+    if market not in backfill_markets:
+        backfill_markets = (market, *backfill_markets)
     config = AppConfig(
         access_key=_text("UPBIT_ACCESS_KEY", ""),
         secret_key=_text("UPBIT_SECRET_KEY", ""),
-        market=_text("MARKET", "USDT-BTC").upper(),
+        market=market,
         dry_run=_bool("DRY_RUN", True),
         live_trading_confirm=_text("LIVE_TRADING_CONFIRM", "NO").upper() == "YES",
         dry_run_quote=_decimal("DRY_RUN_QUOTE", "1000"),
@@ -227,6 +260,7 @@ def load_config() -> AppConfig:
         backfill_db=_text("BACKFILL_DB", "data/ohlcv.sqlite"),
         backfill_csv=_text("BACKFILL_CSV", ""),
         backfill_page_sleep=float(_text("BACKFILL_PAGE_SLEEP", "0.15")),
+        backfill_markets=backfill_markets,
         atr_period=_int("ATR_PERIOD", 14),
         range_lookback=_int("RANGE_LOOKBACK", 120),
         min_grid_rate=_decimal("MIN_GRID_RATE", "0.002"),
@@ -235,6 +269,9 @@ def load_config() -> AppConfig:
         resistance_percentile=_decimal("RESISTANCE_PERCENTILE", "0.90"),
         analyze_refresh_sec=float(_text("ANALYZE_REFRESH_SEC", "60")),
         dynamic_reprice_sec=float(_text("DYNAMIC_REPRICE_SEC", "15")),
+        multi_tf_enabled=_bool("MULTI_TF_ENABLED", True),
+        daily_data_dir=_text("DAILY_DATA_DIR", "data/daily"),
+        daily_sma_period=_int("DAILY_SMA_PERIOD", 20),
     )
     config.validate()
     return config

@@ -22,7 +22,7 @@ from urllib.parse import unquote, urlencode
 import jwt
 import requests
 
-from backfill import OhlcvBar, parse_upbit_candle
+from backfill import DAY_UNIT, OhlcvBar, parse_upbit_candle
 from logger import get_logger
 from strategy import Candle, align_price, to_plain_str
 
@@ -431,8 +431,16 @@ class UpbitREST:
         count: int = 200,
         to: str | None = None,
     ) -> list[OhlcvBar]:
-        """분봉 한 페이지. to 는 그 시각보다 과거 캔들만 받는 업비트 커서입니다."""
+        """분봉/일봉 한 페이지. to 는 그 시각보다 과거 캔들만 받는 업비트 커서입니다.
+
+        unit 이 DAY_UNIT(1440) 이면 /v1/candles/days, 그 외는 분봉 API 를 씁니다.
+        시각은 candle_date_time_utc(UTC) 기준입니다.
+        """
         safe_count = max(1, min(int(count), 200))
+        if int(unit) == DAY_UNIT:
+            path = "/v1/candles/days"
+        else:
+            path = f"/v1/candles/minutes/{unit}"
 
         def call() -> list[OhlcvBar]:
             params = {"market": market, "count": str(safe_count)}
@@ -440,7 +448,7 @@ class UpbitREST:
                 params["to"] = to
             body = self._request(
                 "GET",
-                f"/v1/candles/minutes/{unit}",
+                path,
                 params,
                 "quotation",
                 auth=False,
@@ -974,7 +982,6 @@ class DryRunExchange:
     ) -> Order:
         cancelled = self.cancel(order_uuid)
         if cancelled.executed_volume > 0 and cancelled.remaining_volume == 0 and not cancelled.is_open:
-            # cancel() zeros remaining. Partial fill keeps executed_volume.
             if cancelled.executed_volume >= cancelled.volume:
                 return cancelled
         if cancelled.executed_volume > 0:
@@ -1151,17 +1158,3 @@ def build_exchange(cfg: Any, market_data: Any = None) -> Any:
             )
         return DryRunExchange(cfg, source)
     return UpbitExchange(cfg)
-
-
-# 시세 전용 객체도 테스트에서 교체할 수 있게 노출합니다.
-def public_client(cfg: Any) -> UpbitREST:
-    return UpbitREST(
-        access_key=cfg.access_key,
-        secret_key=cfg.secret_key,
-        http_timeout=cfg.http_timeout,
-        max_retries=cfg.max_retries,
-        retry_delay=cfg.retry_delay_sec,
-        quotation_rps=cfg.quotation_rps,
-        account_rps=cfg.account_rps,
-        order_rps=cfg.order_rps,
-    )

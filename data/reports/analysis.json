@@ -1,0 +1,223 @@
+{
+  "minute": [
+    {
+      "path": "data/minute/ohlcv_USDT-BTC.csv",
+      "bar_count": 2722,
+      "first_open_time_utc": "2026-11-02T04:34:00",
+      "last_open_time_utc": "2026-11-09T04:01:00",
+      "dynamic_levels": {
+        "support": "74335.0600000000",
+        "resistance": "75886.6160000000",
+        "grid_rate": "0.002",
+        "grid_rate_pct": "0.2000%",
+        "atr": "56.41071428571428571428571429",
+        "atr_rate_pct": "0.0753%",
+        "mean_range_rate_pct": "0.0541%",
+        "round_trip_fee_rate_pct": "0.1000%",
+        "sample_size": 120,
+        "last_close": "74922.55000000"
+      },
+      "history": {
+        "total_return_pct": "-4.6565%",
+        "max_drawdown_pct": "8.3556%",
+        "mean_range_rate_pct": "0.0341%",
+        "first_close": "78581.74000000",
+        "last_close": "74922.55000000",
+        "high": "81000.00000000",
+        "low": "74170.13000000"
+      },
+      "market": "USDT-BTC"
+    },
+    {
+      "path": "data/minute/ohlcv_USDT-ETH.csv",
+      "bar_count": 854,
+      "first_open_time_utc": "2026-11-02T04:12:00",
+      "last_open_time_utc": "2026-11-09T03:55:00",
+      "dynamic_levels": {
+        "support": "2130.0000000000",
+        "resistance": "2241.1500000000",
+        "grid_rate": "0.002",
+        "grid_rate_pct": "0.2000%",
+        "atr": "3.623571428571428571428571429",
+        "atr_rate_pct": "0.1688%",
+        "mean_range_rate_pct": "0.1077%",
+        "round_trip_fee_rate_pct": "0.1000%",
+        "sample_size": 120,
+        "last_close": "2146.13000000"
+      },
+      "history": {
+        "total_return_pct": "-6.9828%",
+        "max_drawdown_pct": "13.6693%",
+        "mean_range_rate_pct": "0.0749%",
+        "first_close": "2307.24000000",
+        "last_close": "2146.13000000",
+        "high": "2449.35000000",
+        "low": "2114.54000000"
+      },
+      "market": "USDT-ETH"
+    }
+  ],
+  "daily": [
+    {
+      "path": "data/daily/ohlcv_USDT-BTC.csv",
+      "bar_count": 1825,
+      "first_open_time_utc": "2021-11-11T00:00:00",
+      "last_open_time_utc": "2026-11-09T00:00:00",
+      "dynamic_levels": {
+        "support": "63089.8880000000",
+        "resistance": "84954.5120000000",
+        "grid_rate": "0.004",
+        "grid_rate_pct": "0.4000%",
+        "atr": "2130.14500000",
+        "atr_rate_pct": "2.8431%",
+        "mean_range_rate_pct": "2.5329%",
+        "round_trip_fee_rate_pct": "0.1000%",
+        "sample_size": 120,
+        "last_close": "74922.55000000"
+      },
+      "history": {
+        "total_return_pct": "15.9338%",
+        "max_drawdown_pct": "76.1297%",
+        "mean_range_rate_pct": "4.1563%",
+        "first_close": "64625.30000000",
+        "last_close": "74922.55000000",
+        "high": "125989.00000000",
+        "low": "14503.00000000"
+      },
+      "market": "USDT-BTC"
+    },
+    {
+      "path": "data/daily/ohlcv_USDT-ETH.csv",
+      "bar_count": 1825,
+      "first_open_time_utc": "2021-11-11T00:00:00",
+      "last_open_time_utc": "2026-11-09T00:00:00",
+      "dynamic_levels": {
+        "support": "1856.5430000000",
+        "resistance": "2717.1350000000",
+        "grid_rate": "0.004",
+        "grid_rate_pct": "0.4000%",
+        "atr": "83.95428571428571428571428571",
+        "atr_rate_pct": "3.9119%",
+        "mean_range_rate_pct": "3.7494%",
+        "round_trip_fee_rate_pct": "0.1000%",
+        "sample_size": 120,
+        "last_close": "2146.13000000"
+      },
+      "history": {
+        "total_return_pct": "-54.9133%",
+        "max_drawdown_pct": "79.1134%",
+        "mean_range_rate_pct": "5.9626%",
+        "first_close": "4760.00899995",
+        "last_close": "2146.13000000",
+        "high": "4994.00000000",
+        "low": "889.12954260"
+      },
+      "market": "USDT-ETH"
+    }
+  ],
+  "scalping_zones": [
+    {
+      "market": "USDT-BTC",
+      "bias": "neutral",
+      "actionable": false,
+      "reason": "일봉 중상단: 신규 스캘핑 보류",
+      "zone_low": "74335.0600000000",
+      "zone_high": "74955.682400000000",
+      "target_rate_pct": "0.3554%",
+      "stop_rate_pct": "0.5000%",
+      "reference_buy": "74645.37",
+      "target_sell": "74910.66",
+      "stop_price": "74272.14",
+      "daily_position_pct": "54.1178%",
+      "daily_sma": "78717.55050000",
+      "minute_levels": {
+        "support": "74335.0600000000",
+        "resistance": "75886.6160000000",
+        "grid_rate": "0.002",
+        "grid_rate_pct": "0.2000%",
+        "atr": "56.41071428571428571428571429",
+        "atr_rate_pct": "0.0753%",
+        "mean_range_rate_pct": "0.0541%",
+        "round_trip_fee_rate_pct": "0.1000%",
+        "sample_size": 120,
+        "last_close": "74922.55000000"
+      },
+      "daily_levels": {
+        "support": "63089.8880000000",
+        "resistance": "84954.5120000000",
+        "grid_rate": "0.004",
+        "grid_rate_pct": "0.4000%",
+        "atr": "2130.14500000",
+        "atr_rate_pct": "2.8431%",
+        "mean_range_rate_pct": "2.5329%",
+        "round_trip_fee_rate_pct": "0.1000%",
+        "sample_size": 120,
+        "last_close": "74922.55000000"
+      },
+      "blended_levels": {
+        "support": "74335.0600000000",
+        "resistance": "75886.6160000000",
+        "grid_rate": "0.003553911672787431821260755274",
+        "grid_rate_pct": "0.3554%",
+        "atr": "56.41071428571428571428571429",
+        "atr_rate_pct": "0.0753%",
+        "mean_range_rate_pct": "0.0541%",
+        "round_trip_fee_rate_pct": "0.1000%",
+        "sample_size": 120,
+        "last_close": "74922.55000000"
+      }
+    },
+    {
+      "market": "USDT-ETH",
+      "bias": "long_bias",
+      "actionable": true,
+      "reason": "일봉 하단 구간: 분봉 저가 매수 허용",
+      "zone_low": "2130.0000000000",
+      "zone_high": "2174.460000000000",
+      "target_rate_pct": "0.4000%",
+      "stop_rate_pct": "0.5000%",
+      "reference_buy": "2152.23",
+      "target_sell": "2160.84",
+      "stop_price": "2141.46",
+      "daily_position_pct": "33.6497%",
+      "daily_sma": "2296.55400000",
+      "minute_levels": {
+        "support": "2130.0000000000",
+        "resistance": "2241.1500000000",
+        "grid_rate": "0.002",
+        "grid_rate_pct": "0.2000%",
+        "atr": "3.623571428571428571428571429",
+        "atr_rate_pct": "0.1688%",
+        "mean_range_rate_pct": "0.1077%",
+        "round_trip_fee_rate_pct": "0.1000%",
+        "sample_size": 120,
+        "last_close": "2146.13000000"
+      },
+      "daily_levels": {
+        "support": "1856.5430000000",
+        "resistance": "2717.1350000000",
+        "grid_rate": "0.004",
+        "grid_rate_pct": "0.4000%",
+        "atr": "83.95428571428571428571428571",
+        "atr_rate_pct": "3.9119%",
+        "mean_range_rate_pct": "3.7494%",
+        "round_trip_fee_rate_pct": "0.1000%",
+        "sample_size": 120,
+        "last_close": "2146.13000000"
+      },
+      "blended_levels": {
+        "support": "2130.0000000000",
+        "resistance": "2241.1500000000",
+        "grid_rate": "0.004",
+        "grid_rate_pct": "0.4000%",
+        "atr": "3.623571428571428571428571429",
+        "atr_rate_pct": "0.1688%",
+        "mean_range_rate_pct": "0.1077%",
+        "round_trip_fee_rate_pct": "0.1000%",
+        "sample_size": 120,
+        "last_close": "2146.13000000"
+      }
+    }
+  ],
+  "daily_btc_eth_close_correlation": "0.662853"
+}
