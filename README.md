@@ -26,6 +26,23 @@
 
 손절은 업비트 조건부 주문이 아닙니다. **프로세스가 꺼지거나 네트워크가 끊기면 손절되지 않습니다.** 종료 시 미체결 매수는 취소하고, 이미 든 코인의 매도 주문은 거래소에 남겨 둡니다.
 
+## 분할 구간 모드 (기본, STRATEGY_MODE=ladder)
+
+보유 USDT 를 여러 구간으로 나눠 하락 구간별로 사고, 구간별로 3% 오르면 파는 방식입니다. 근거와 한계는 `STRATEGY_REVIEW.md` 의 "2차 검토"에 있습니다.
+
+- 앵커 = 처음 시작할 때의 현재가(`LADDER_ANCHOR_MODE=price`). 보유 구간이 하나도 없을 때만 시세를 따라 올라가고, 내려가지는 않습니다. k 번째 구간 매수가 = 앵커 x 0.97^k. 구간당 투입액 = `LADDER_BUDGET_QUOTE / LADDER_SLOTS`.
+- 체결된 구간은 체결가 +3% 에 지정가 매도를 걸고, 팔리면 그 구간을 다시 매수 대기합니다. 손절은 없습니다.
+- 시작 직후에는 아무것도 사지 않고, 현재가에서 3% 내려가야 첫 구간을 삽니다. `LADDER_ANCHOR_MODE=high`(직전 120일 최고 종가 기준)로 바꾸면 시세가 이미 여러 구간 아래일 때 그 구간들을 현재가에 바로 삽니다.
+- 실전 재시작 시 앵커는 `ladder_state.json` 에서 이어받습니다.
+- 봇은 자신이 낸 주문으로 산 수량만 팝니다. 계좌의 다른 BTC 는 건드리지 않습니다.
+- `STOP` 파일: 새 매수 중지(걸린 매도 유지). `FLATTEN` 파일: 봇 보유분만 시장가 정리(손실 확정 가능). 파일을 지우면 재개합니다.
+- 상태는 `ladder_state.json` 에 저장됩니다. 실전에서 이 파일을 지우면 봇이 자기 주문을 잊으므로 지우지 마세요.
+
+```
+python backtest_ladder.py data/daily/ohlcv_USDT-BTC.csv     # 설정 검증(학습/검증 분리)
+DRY_RUN=true python main.py                                 # 모의 실행
+```
+
 ## 프로젝트 구조
 
 | 파일 | 역할 |
@@ -102,6 +119,11 @@ python report.py            # 스캘핑 구간 리포트
 python backfill.py --timeframe day --days 1825
 python backfill.py --timeframe minute --hours 168
 ```
+
+## 실전 운영
+
+API 키와 서버 IP 를 넣어 실전 가동하는 절차, 킬스위치(`STOP`/`FLATTEN`), 텔레그램 알림, systemd 배포는 [DEPLOY.md](DEPLOY.md) 를 보세요.
+`python preflight.py` 가 서버 공인 IP(업비트 허용 IP 에 등록할 값), 키 권한, 수수료를 점검합니다.
 
 ## .env
 

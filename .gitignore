@@ -25,3 +25,9 @@ data/**/*.sqlite-*
 *.sqlite
 *.sqlite-journal
 *.sqlite-wal
+
+# 분할 구간 모드 런타임 파일
+ladder_state.json
+bot.heartbeat
+STOP
+FLATTEN

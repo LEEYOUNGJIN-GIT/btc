@@ -1,0 +1,26 @@
+[Unit]
+Description=Upbit USDT scalping bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=btcbot
+Group=btcbot
+WorkingDirectory=/opt/btc-bot
+EnvironmentFile=/opt/btc-bot/.env
+ExecStart=/opt/btc-bot/.venv/bin/python /opt/btc-bot/main.py
+Restart=always
+RestartSec=5
+# 종료 코드 2 = 설정 오류/API 키/IP/권한 오류. 재시작해도 해결되지 않으므로 반복하지 않습니다.
+RestartPreventExitStatus=2
+KillSignal=SIGTERM
+TimeoutStopSec=30
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/btc-bot
+PrivateTmp=true
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

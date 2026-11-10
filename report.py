@@ -60,10 +60,12 @@ def analyze_csv(
     range_lookback: int,
     min_grid_rate: Decimal,
     max_grid_rate: Decimal,
+    period_ms: int | None = None,
 ) -> dict[str, Any]:
     bars = load_ohlcv_csv(str(path))
     levels = analyze(
         bars,
+        period_ms=period_ms,
         buy_fee_rate=buy_fee_rate,
         sell_fee_rate=sell_fee_rate,
         atr_period=atr_period,
@@ -157,6 +159,7 @@ def build_report(
                 range_lookback=range_lookback,
                 min_grid_rate=min_grid_rate,
                 max_grid_rate=max_grid_rate,
+                period_ms=60_000,
             )
             market = _market_from_name(path)
             item["market"] = market
