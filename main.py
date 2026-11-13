@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import signal
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -26,7 +27,10 @@ from backfill import (
     export_markets_csv,
     load_ohlcv_csv,
 )
-from config import AppConfig, load_config
+from config import AppConfig, load_config, validate_live_safety
+from hints import FATAL_AUTH_NAMES, explain_upbit_error
+from ladder import LadderBot, LadderConfigError
+from notifier import Notifier, build_notifier
 from scalp_zone import ScalpingZone, compute_scalping_zone
 from exchange_api import (
     NullFeed,
@@ -68,8 +72,16 @@ class Position:
 
 
 class RoundTripBot:
-    def __init__(self, cfg: AppConfig, exchange: object, strategy: Strategy, feed: PriceFeed):
+    def __init__(
+        self,
+        cfg: AppConfig,
+        exchange: object,
+        strategy: Strategy,
+        feed: PriceFeed,
+        notifier: Notifier | None = None,
+    ):
         self.cfg = cfg
+        self.notifier: Notifier = notifier if notifier is not None else Notifier()
         self.exchange = exchange
         self.strategy = strategy
         self.feed = feed
@@ -95,6 +107,10 @@ class RoundTripBot:
         self._levels_monotonic = 0.0
         self.scalping_zone: ScalpingZone | None = None
         self._once_key = ""
+        self._halt_notified = False
+        self._err_streak = 0
+        self._last_heartbeat = 0.0
+        self._drain_noted = False
 
     def request_stop(self) -> None:
         self._stop = True
@@ -104,16 +120,29 @@ class RoundTripBot:
         if self._stop:
             return
         self._boot()
+        mode = "모의거래" if self.cfg.dry_run else "실전"
+        self.notifier.notify(f"시작 | {mode} | {self.cfg.market} | 상태 {self.phase}")
+        self._notify_halt_once()
         while not self._stop:
             if self.cfg.max_runtime_sec > 0 and time.monotonic() - self._started >= self.cfg.max_runtime_sec:
                 logger.info("MAX_RUNTIME_SEC 에 도달해 종료합니다.")
                 break
             try:
                 self.step()
-            except Exception:
+            except Exception as exc:
+                self._err_streak += 1
                 logger.exception("루프 오류. 프로세스는 유지하고 다음 주기에 재시도합니다.")
+                if self._err_streak >= self.cfg.error_alert_threshold:
+                    self.notifier.notify(
+                        f"루프 오류 {self._err_streak}회 연속 ({type(exc).__name__}). 로그를 확인하세요. 상태 {self.phase}",
+                        key="loop-error",
+                        cooldown=300,
+                    )
                 self._sleep(min(max(self.cfg.retry_delay_sec, 1.0), 10.0))
                 continue
+            self._err_streak = 0
+            if self.phase != "HALT":
+                self.notifier.ping()
             self._sleep(self.cfg.loop_interval_sec)
         self.shutdown()
 
@@ -123,12 +152,17 @@ class RoundTripBot:
         self._roll_daily()
         snapshot = self._snapshot()
         self._steps += 1
+        self._write_heartbeat()
         if self._steps % self.cfg.health_every == 0:
             self._log_health(snapshot)
         if self.phase == "HALT":
             if not self._halt_logged:
                 logger.error("봇이 중지 상태입니다. 잔고와 미체결 주문을 확인한 뒤 다시 실행하세요.")
                 self._halt_logged = True
+            self._notify_halt_once()
+            return
+        if self._handle_operator_switches(snapshot):
+            self._notify_halt_once()
             return
         if self.phase == "FLAT":
             self._step_flat(snapshot)
@@ -141,6 +175,86 @@ class RoundTripBot:
         else:
             logger.error("알 수 없는 상태 %s. 중지합니다.", self.phase)
             self.phase = "HALT"
+        self._notify_halt_once()
+
+    def _stop_hit(self, snapshot: MarketSnapshot) -> bool:
+        """손절은 STOP_LOSS_ENABLED=true 일 때만 실행합니다. 기본은 꺼짐(손절가 계산만 유지)."""
+        if not self.cfg.stop_loss_enabled or self.position is None:
+            return False
+        return self.strategy.should_stop(snapshot.trade_price, self.position.stop_price)
+
+    def _flag_exists(self, name: str) -> bool:
+        return bool(name) and Path(name).exists()
+
+    def _notify_halt_once(self) -> None:
+        if self.phase == "HALT" and not self._halt_notified:
+            self._halt_notified = True
+            self.notifier.notify(
+                "봇이 HALT 상태로 멈췄습니다. 거래소에서 잔고와 미체결 주문을 직접 확인하세요.",
+                key="halt",
+            )
+        elif self.phase != "HALT":
+            self._halt_notified = False
+
+    def _write_heartbeat(self) -> None:
+        path = self.cfg.heartbeat_file
+        now = time.monotonic()
+        if not path or now - self._last_heartbeat < 10:
+            return
+        self._last_heartbeat = now
+        try:
+            Path(path).write_text(
+                json.dumps({"ts": time.time(), "phase": self.phase, "market": self.cfg.market}),
+                encoding="utf-8",
+            )
+        except OSError:
+            logger.warning("하트비트 파일을 쓰지 못했습니다: %s", path)
+
+    def _buy_power(self, available: Decimal) -> Decimal:
+        cap = self.cfg.max_order_quote
+        if cap > 0 and available > cap:
+            return cap
+        return available
+
+    def _handle_operator_switches(self, snapshot: MarketSnapshot) -> bool:
+        """STOP/FLATTEN 파일 처리. True 면 이번 주기의 일반 처리를 건너뜁니다."""
+        flatten = self._flag_exists(self.cfg.flatten_file)
+        drain = flatten or self._flag_exists(self.cfg.kill_switch_file)
+        if not drain:
+            self._drain_noted = False
+            return False
+        if not self._drain_noted:
+            self._drain_noted = True
+            kind = "FLATTEN(전량 청산)" if flatten else "STOP(신규 진입 중단)"
+            logger.warning("%s 파일이 감지되었습니다. 신규 매수를 하지 않습니다.", kind)
+            self.notifier.notify(f"{kind} 감지. 신규 매수 중단. 상태 {self.phase}")
+        if self.phase == "FLAT":
+            return True
+        if self.phase == "BUY_WAIT":
+            closed = self._cancel_tracked()
+            if closed is not None and closed.executed_volume > 0:
+                self._on_buy_filled(closed)
+                if not flatten:
+                    return True
+            else:
+                self._enter_flat()
+                return True
+        if flatten and self.phase in {"HOLDING", "SELL_WAIT"}:
+            self._manual_flatten(snapshot)
+            return True
+        return False
+
+    def _manual_flatten(self, snapshot: MarketSnapshot) -> None:
+        if self.position is None:
+            self._enter_flat()
+            return
+        logger.warning("수동 전량 청산 | 현재가 %s | 매수가 %s", to_plain_str(snapshot.trade_price), to_plain_str(self.position.buy_price))
+        if self.order_uuid:
+            cancelled = self._cancel_tracked()
+            if cancelled and cancelled.executed_volume > 0:
+                self._account_sell(cancelled)
+            self.order_uuid = None
+        self._liquidate(snapshot, "수동 청산")
 
     def shutdown(self) -> None:
         if self.phase == "BUY_WAIT" and self.order_uuid and self.cfg.cancel_buy_on_exit:
@@ -155,6 +269,10 @@ class RoundTripBot:
             logger.warning(
                 "종료해도 코인 잔고/매도 주문은 그대로 둡니다. uuid=%s. 봇이 꺼지면 손절은 실행되지 않습니다.",
                 self.order_uuid,
+            )
+            self.notifier.notify(
+                f"봇 종료. 코인 보유/매도 주문이 남아 있고 손절은 동작하지 않습니다. 상태 {self.phase}",
+                key="shutdown-holding",
             )
 
     def _countdown(self) -> None:
@@ -189,7 +307,10 @@ class RoundTripBot:
                 self.cfg.sell_fee_rate = ask
         self._maybe_refresh_levels(force=True)
         self._log_pricing()
-        logger.warning("손절은 이 프로세스가 켜져 있을 때만 동작합니다. 숏 주문은 넣지 않습니다.")
+        if self.cfg.stop_loss_enabled:
+            logger.warning("손절 켜짐. 이 프로세스가 켜져 있을 때만 동작합니다. 숏 주문은 넣지 않습니다.")
+        else:
+            logger.warning("손절 꺼짐(STOP_LOSS_ENABLED=false). 매수가 아래로 내려가도 매도 목표가에 닿을 때까지 보유합니다.")
         if self.cfg.balance_use_ratio == 1:
             logger.warning("주문 가능 USDT 를 매수에 사용합니다. 첫 실전은 BALANCE_USE_RATIO 를 낮추세요.")
         if self.cfg.dry_run:
@@ -247,7 +368,7 @@ class RoundTripBot:
                 f"멀티TF 스캘핑 비활성({self.scalping_zone.bias}): {self.scalping_zone.reason}"
             )
             return
-        decision = self.strategy.plan_buy(snapshot, self.exchange.quote_available())
+        decision = self.strategy.plan_buy(snapshot, self._buy_power(self.exchange.quote_available()))
         if decision.plan is None:
             self._log_skip(decision.skip_reason or "매수 조건 아님")
             return
@@ -261,6 +382,12 @@ class RoundTripBot:
                 to_plain_str(plan.notional),
             )
         spread = (snapshot.best_ask - snapshot.best_bid) / snapshot.best_bid
+        if self.cfg.max_spread_rate > 0 and spread > self.cfg.max_spread_rate:
+            self._log_skip(
+                f"스프레드 {spread * 100:.4f}% 가 상한 {float(self.cfg.max_spread_rate * 100):.4f}% 보다 넓어 "
+                "매수를 보류합니다(스프레드가 목표 이익을 잠식)."
+            )
+            return
         if self.strategy.levels is not None:
             edge = self.strategy.levels.grid_rate
             edge_name = "그리드 간격"
@@ -325,7 +452,7 @@ class RoundTripBot:
             closed = self._cancel_tracked()
             self._on_buy_filled(closed or order)
             return
-        power = self.exchange.quote_available() + self._reserved_quote(order)
+        power = self._buy_power(self.exchange.quote_available() + self._reserved_quote(order))
         decision = self.strategy.plan_buy(snapshot, power)
         if decision.plan is None:
             logger.info("재호가 조건이 사라져 미체결 매수를 취소합니다. %s", decision.skip_reason)
@@ -357,7 +484,7 @@ class RoundTripBot:
         logger.info("매수 재호가 | price=%s volume=%s", to_plain_str(plan.price), to_plain_str(replaced.volume))
 
     def _step_holding(self, snapshot: MarketSnapshot) -> None:
-        if self.position and self.strategy.should_stop(snapshot.trade_price, self.position.stop_price):
+        if self._stop_hit(snapshot):
             self._execute_stop(snapshot)
             return
         self._place_take_profit()
@@ -379,7 +506,7 @@ class RoundTripBot:
                 return
             self._finish_exit(snapshot, "지정가 매도")
             return
-        if self.position and self.strategy.should_stop(snapshot.trade_price, self.position.stop_price):
+        if self._stop_hit(snapshot):
             self._execute_stop(snapshot)
             return
         if order.price is None or self.position is None:
@@ -435,6 +562,9 @@ class RoundTripBot:
             to_plain_str(snapshot.trade_price),
             to_plain_str(self.position.stop_price),
             to_plain_str(self.position.buy_price),
+        )
+        self.notifier.notify(
+            f"손절 실행 | 현재가 {to_plain_str(snapshot.trade_price)} <= 손절가 {to_plain_str(self.position.stop_price)}"
         )
         if self.order_uuid:
             cancelled = self._cancel_tracked()
@@ -534,6 +664,9 @@ class RoundTripBot:
         )
         self.phase = "HOLDING"
         self._save()
+        self.notifier.notify(
+            f"매수 체결 {self.cfg.market} | 가격 {to_plain_str(buy_price)} | 수량 {to_plain_str(volume)} | 손절가 {to_plain_str(self.position.stop_price)}"
+        )
         self._place_take_profit()
 
     def _place_take_profit(self) -> None:
@@ -774,6 +907,9 @@ class RoundTripBot:
             f"{ratio * 100:.4f}",
             " | 복구 추정치" if position.estimated else "",
         )
+        self.notifier.notify(
+            f"청산({reason}) | 순손익 {to_plain_str(net)} {self.cfg.quote} ({ratio * 100:.3f}%) | 당일 누적 {to_plain_str(self.realized)}"
+        )
         if self._loss_limit_hit():
             logger.error(
                 "당일 누적 실현손익 %s %s 가 한도 -%s 에 도달했습니다.",
@@ -815,7 +951,7 @@ class RoundTripBot:
             return False
         if time.time() - self.order_placed_at < self.cfg.dynamic_reprice_sec:
             return False
-        power = self.exchange.quote_available() + self._reserved_quote(order)
+        power = self._buy_power(self.exchange.quote_available() + self._reserved_quote(order))
         decision = self.strategy.plan_buy(snapshot, power)
         return decision.plan is not None and decision.plan.price != order.price
 
@@ -915,6 +1051,7 @@ class RoundTripBot:
             max_grid_rate=self.cfg.max_grid_rate,
             support_percentile=self.cfg.support_percentile,
             resistance_percentile=self.cfg.resistance_percentile,
+            period_ms=period_ms,
         )
         zone = self._multi_tf_zone(usable)
         if zone is not None:
@@ -978,6 +1115,7 @@ class RoundTripBot:
                 breakdown_buffer=self.cfg.breakdown_buffer,
                 stop_loss_rate=self.cfg.stop_loss_rate,
                 daily_sma_period=self.cfg.daily_sma_period,
+                minute_period_ms=self.cfg.backfill_unit * 60_000,
             )
         except Exception:
             logger.exception("멀티TF 스캘핑 구간 산출 실패. 분봉 단독으로 진행합니다.")
@@ -1234,13 +1372,33 @@ class RoundTripBot:
             time.sleep(min(0.2, deadline - time.monotonic()))
 
 
+def _fail(message: str, notifier: Notifier | None = None) -> None:
+    logger.error(message)
+    print(message, file=sys.stderr)
+    if notifier is not None:
+        notifier.notify_sync(message)
+    sys.exit(2)
+
+
 def main() -> None:
-    cfg = load_config()
+    try:
+        cfg = load_config()
+        validate_live_safety(cfg)
+    except ValueError as exc:
+        print(f"설정 오류: {exc}", file=sys.stderr)
+        sys.exit(2)
     setup_logger(cfg.log_file, cfg.log_level)
+    notifier = build_notifier(cfg)
     exchange = build_exchange(cfg)
-    strategy = Strategy(cfg.to_strategy_params())
-    feed: PriceFeed = WebsocketTicker(cfg.market) if cfg.use_websocket else NullFeed()
-    bot = RoundTripBot(cfg, exchange, strategy, feed)
+    feed: PriceFeed
+    if cfg.strategy_mode == "ladder":
+        # 분할 구간 모드는 몇 초 간격의 REST 조회로 충분해 웹소켓을 쓰지 않습니다.
+        feed = NullFeed()
+        bot: LadderBot | RoundTripBot = LadderBot(cfg, exchange, notifier)
+    else:
+        strategy = Strategy(cfg.to_strategy_params())
+        feed = WebsocketTicker(cfg.market) if cfg.use_websocket else NullFeed()
+        bot = RoundTripBot(cfg, exchange, strategy, feed, notifier)
 
     def _handle(signum: int, _frame: object) -> None:
         logger.info("종료 신호 %s 를 받았습니다.", signum)
@@ -1250,6 +1408,14 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _handle)
     try:
         bot.run()
+    except LadderConfigError as exc:
+        _fail(f"시작 실패: {exc}", notifier)
+    except UpbitAPIError as exc:
+        # 시작 단계(_boot)의 인증/IP/권한 오류. 재시작해도 해결되지 않으므로 종료 코드 2 로 끝냅니다.
+        text = explain_upbit_error(exc.name, str(exc))
+        if exc.name in FATAL_AUTH_NAMES:
+            _fail(f"시작 실패: {text}", notifier)
+        raise
     finally:
         feed.close()
 

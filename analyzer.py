@@ -28,6 +28,44 @@ class DynamicLevels:
     last_close: Decimal
 
 
+def fill_gaps(bars: Sequence[OhlcvBar], period_ms: int, max_fill: int = 2000) -> list[OhlcvBar]:
+    """거래가 없어 빠진 봉을 직전 종가의 평평한 봉으로 채웁니다.
+
+    업비트는 체결이 없는 분에는 캔들을 주지 않습니다. 거래가 얇은 USDT 마켓은 분봉의 70% 이상이
+    비어 있어(USDT-BTC 7일 표본 27% 만 존재), 봉 개수 기준 lookback·ATR 이 실제 시간보다 훨씬 긴 구간을
+    보게 됩니다. 시간축을 고정해 ATR 과 지지/저항이 '시간' 기준 변동성을 반영하게 합니다.
+    """
+    ordered = sorted(bars, key=lambda bar: bar.timestamp_ms)
+    if period_ms <= 0 or len(ordered) < 2:
+        return list(ordered)
+    out: list[OhlcvBar] = [ordered[0]]
+    for bar in ordered[1:]:
+        prev = out[-1]
+        missing = (bar.timestamp_ms - prev.timestamp_ms) // period_ms - 1
+        if 0 < missing <= max_fill:
+            for step in range(1, int(missing) + 1):
+                ts = prev.timestamp_ms + step * period_ms
+                out.append(
+                    OhlcvBar(
+                        timestamp_ms=ts,
+                        open_time=_iso_utc(ts),
+                        open=prev.close,
+                        high=prev.close,
+                        low=prev.close,
+                        close=prev.close,
+                        volume=Decimal("0"),
+                    )
+                )
+        out.append(bar)
+    return out
+
+
+def _iso_utc(timestamp_ms: int) -> str:
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+
 def analyze(
     bars: Sequence[OhlcvBar],
     *,
@@ -39,7 +77,10 @@ def analyze(
     max_grid_rate: Decimal = Decimal("0.004"),
     support_percentile: Decimal = Decimal("0.10"),
     resistance_percentile: Decimal = Decimal("0.90"),
+    period_ms: int | None = None,
 ) -> DynamicLevels:
+    if period_ms:
+        bars = fill_gaps(bars, period_ms)
     if atr_period < 2:
         raise ValueError("ATR 기간은 2 이상이어야 합니다.")
     if not Decimal("0") < min_grid_rate < Decimal("1"):

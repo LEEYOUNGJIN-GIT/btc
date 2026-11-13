@@ -64,6 +64,7 @@ def compute_scalping_zone(
     breakdown_buffer: Decimal = Decimal("0.002"),
     stop_loss_rate: Decimal = Decimal("0.005"),
     daily_sma_period: int = 20,
+    minute_period_ms: int = 60_000,
 ) -> ScalpingZone:
     """분봉·일봉 기술적 지표로 스캘핑 허용 구간을 만듭니다."""
     if not Decimal("0") < entry_zone <= 1:
@@ -78,6 +79,7 @@ def compute_scalping_zone(
         max_grid_rate=max_grid_rate,
         support_percentile=support_percentile,
         resistance_percentile=resistance_percentile,
+        period_ms=minute_period_ms,
     )
     daily = analyze(
         daily_bars,

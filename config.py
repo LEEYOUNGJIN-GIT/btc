@@ -105,6 +105,28 @@ class AppConfig:
     multi_tf_enabled: bool = True
     daily_data_dir: str = "data/daily"
     daily_sma_period: int = 20
+    stop_loss_enabled: bool = False
+    max_spread_rate: Decimal = Decimal("0.001")
+    kill_switch_file: str = "STOP"
+    flatten_file: str = "FLATTEN"
+    heartbeat_file: str = "bot.heartbeat"
+    max_order_quote: Decimal = Decimal("0")
+    allow_no_loss_limit: bool = False
+    error_alert_threshold: int = 5
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    healthcheck_url: str = ""
+    strategy_mode: str = "ladder"
+    ladder_step_rate: Decimal = Decimal("0.03")
+    ladder_slots: int = 10
+    ladder_lookback_days: int = 120
+    ladder_budget_quote: Decimal = Decimal("0")
+    ladder_max_open_buys: int = 3
+    ladder_anchor_refresh_sec: float = 3600
+    ladder_state_file: str = "ladder_state.json"
+    ladder_poll_sec: float = 5
+    ladder_anchor_mode: str = "price"
+    ladder_reanchor_rate: Decimal = Decimal("0.005")
 
     @property
     def quote(self) -> str:
@@ -135,6 +157,14 @@ class AppConfig:
             raise ValueError("MARKET 은 USDT-BTC 처럼 QUOTE-BASE 형식이어야 합니다.")
         if self.quote != "USDT":
             raise ValueError("이 봇의 호가 단위·최소금액 규칙은 USDT 마켓 기준입니다.")
+        if self.strategy_mode not in {"ladder", "scalp"}:
+            raise ValueError("STRATEGY_MODE 는 ladder 또는 scalp 입니다.")
+        if self.ladder_anchor_mode not in {"price", "high"}:
+            raise ValueError("LADDER_ANCHOR_MODE 는 price 또는 high 입니다.")
+        if self.ladder_reanchor_rate < 0:
+            raise ValueError("LADDER_REANCHOR_RATE 는 0 이상이어야 합니다.")
+        if self.ladder_max_open_buys < 1:
+            raise ValueError("LADDER_MAX_OPEN_BUYS 는 1 이상이어야 합니다.")
         if self.stop_loss_order_type not in {"market", "limit"}:
             raise ValueError("STOP_LOSS_ORDER_TYPE 은 market 또는 limit 입니다.")
         if self.box_candle_unit not in {1, 3, 5, 10, 15, 30, 60, 240}:
@@ -193,6 +223,28 @@ class AppConfig:
                 raise ValueError("실전 주문은 LIVE_TRADING_CONFIRM=YES 일 때만 허용됩니다.")
 
 
+def validate_live_safety(cfg: "AppConfig") -> None:
+    """실전 모드 전용 안전 규칙. main() 에서만 호출합니다(기존 테스트 설정과 분리)."""
+    if cfg.max_order_quote < 0:
+        raise ValueError("MAX_ORDER_QUOTE 는 0 이상이어야 합니다(0 은 제한 없음).")
+    if cfg.error_alert_threshold < 1:
+        raise ValueError("ERROR_ALERT_THRESHOLD 는 1 이상이어야 합니다.")
+    if bool(cfg.telegram_bot_token) != bool(cfg.telegram_chat_id):
+        raise ValueError("TELEGRAM_BOT_TOKEN 과 TELEGRAM_CHAT_ID 는 함께 설정하거나 함께 비워야 합니다.")
+    if cfg.dry_run:
+        return
+    if cfg.strategy_mode == "ladder":
+        # 분할 구간 모드는 손절이 없어 일일 손실 한도가 작동하지 않습니다. 투입 총액이 상한입니다.
+        if cfg.ladder_budget_quote <= 0:
+            raise ValueError("실전 분할 구간 모드에는 LADDER_BUDGET_QUOTE(투입할 USDT 총액)가 0보다 커야 합니다.")
+        return
+    if cfg.max_daily_loss_quote <= 0 and not cfg.allow_no_loss_limit:
+        raise ValueError(
+            "실전 모드에는 MAX_DAILY_LOSS_QUOTE(일일 최대 손실, USDT)가 0보다 커야 합니다. "
+            "의도적으로 끄려면 ALLOW_NO_LOSS_LIMIT=true 를 명시하세요."
+        )
+
+
 def _markets(name: str, default: str) -> tuple[str, ...]:
     value = _text(name, default)
     markets: list[str] = []
@@ -221,8 +273,8 @@ def load_config() -> AppConfig:
         dry_run=_bool("DRY_RUN", True),
         live_trading_confirm=_text("LIVE_TRADING_CONFIRM", "NO").upper() == "YES",
         dry_run_quote=_decimal("DRY_RUN_QUOTE", "1000"),
-        buy_fee_rate=_decimal("BUY_FEE_RATE", "0.0005"),
-        sell_fee_rate=_decimal("SELL_FEE_RATE", "0.0005"),
+        buy_fee_rate=_decimal("BUY_FEE_RATE", "0.0025"),
+        sell_fee_rate=_decimal("SELL_FEE_RATE", "0.0025"),
         target_profit_rate=_decimal("TARGET_PROFIT_RATE", "0.0025"),
         stop_loss_rate=_decimal("STOP_LOSS_RATE", "0.005"),
         stop_loss_order_type=_text("STOP_LOSS_ORDER_TYPE", "market").lower(),
@@ -272,6 +324,28 @@ def load_config() -> AppConfig:
         multi_tf_enabled=_bool("MULTI_TF_ENABLED", True),
         daily_data_dir=_text("DAILY_DATA_DIR", "data/daily"),
         daily_sma_period=_int("DAILY_SMA_PERIOD", 20),
+        stop_loss_enabled=_bool("STOP_LOSS_ENABLED", False),
+        max_spread_rate=_decimal("MAX_SPREAD_RATE", "0.001"),
+        kill_switch_file=_text("KILL_SWITCH_FILE", "STOP"),
+        flatten_file=_text("FLATTEN_FILE", "FLATTEN"),
+        heartbeat_file=_text("HEARTBEAT_FILE", "bot.heartbeat"),
+        max_order_quote=_decimal("MAX_ORDER_QUOTE", "0"),
+        allow_no_loss_limit=_bool("ALLOW_NO_LOSS_LIMIT", False),
+        error_alert_threshold=_int("ERROR_ALERT_THRESHOLD", 5),
+        telegram_bot_token=_text("TELEGRAM_BOT_TOKEN", ""),
+        telegram_chat_id=_text("TELEGRAM_CHAT_ID", ""),
+        healthcheck_url=_text("HEALTHCHECK_URL", ""),
+        strategy_mode=_text("STRATEGY_MODE", "ladder").lower(),
+        ladder_step_rate=_decimal("LADDER_STEP_RATE", "0.03"),
+        ladder_slots=_int("LADDER_SLOTS", 10),
+        ladder_lookback_days=_int("LADDER_LOOKBACK_DAYS", 120),
+        ladder_budget_quote=_decimal("LADDER_BUDGET_QUOTE", "0"),
+        ladder_max_open_buys=_int("LADDER_MAX_OPEN_BUYS", 3),
+        ladder_anchor_refresh_sec=float(_text("LADDER_ANCHOR_REFRESH_SEC", "3600")),
+        ladder_state_file=_text("LADDER_STATE_FILE", "ladder_state.json"),
+        ladder_poll_sec=float(_text("LADDER_POLL_SEC", "5")),
+        ladder_anchor_mode=_text("LADDER_ANCHOR_MODE", "price").lower(),
+        ladder_reanchor_rate=_decimal("LADDER_REANCHOR_RATE", "0.005"),
     )
     config.validate()
     return config
