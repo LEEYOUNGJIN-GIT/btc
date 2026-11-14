@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """USDT 현물 왕복 스캘핑 루프.
 
-FLAT -> 박스 하단에서 USDT 전액 지정가 매수 -> 체결되면 수수료와 목표 수익을 반영한
-지정가 매도 -> 체결되면 다시 현금. 숏은 하지 않습니다.
-손절은 거래소 조건부 주문이 아니라, 프로세스가 살아 있을 때 현재가를 보고 실행합니다.
+FLAT -> 박스 하단에서 USDT 지정가 매수(잔여 USDT 소진까지 축적) -> 이번 buy lot만
+목표가 지정가 매도 -> 체결되면 다시 현금. 숏은 하지 않습니다.
+손절은 기본 비활성입니다. STOP_LOSS_ENABLED=true 일 때만 프로세스가 현재가를 보고 청산합니다.
 """
 
 from __future__ import annotations
@@ -146,14 +146,21 @@ class RoundTripBot:
         if self.phase == "BUY_WAIT" and self.order_uuid and self.cfg.cancel_buy_on_exit:
             try:
                 self._user_cancel = True
-                self.exchange.cancel(self.order_uuid)
+                cancelled = self.exchange.cancel(self.order_uuid)
                 logger.info("종료 전 미체결 매수 %s 를 취소했습니다.", self.order_uuid)
-                self._enter_flat()
+                self.order_uuid = None
+                if cancelled and cancelled.executed_volume > 0:
+                    self._on_buy_filled(cancelled)
+                elif self.position is not None:
+                    self.phase = "HOLDING"
+                    self._save()
+                else:
+                    self._enter_flat()
             except Exception:
                 logger.exception("종료 시 매수 취소에 실패했습니다. 거래소에서 직접 확인하세요.")
         elif self.phase in {"SELL_WAIT", "HOLDING"}:
             logger.warning(
-                "종료해도 코인 잔고/매도 주문은 그대로 둡니다. uuid=%s. 봇이 꺼지면 손절은 실행되지 않습니다.",
+                "종료해도 코인 잔고/매도 주문은 그대로 둡니다. uuid=%s. 손절 기본 비활성·프로세스 중단 시에도 자동 청산 없음.",
                 self.order_uuid,
             )
 
@@ -243,19 +250,38 @@ class RoundTripBot:
         if time.time() < self.cooldown_until:
             return
         if self.scalping_zone is not None and not self.scalping_zone.actionable:
+            if self.position is not None:
+                logger.info(
+                    "멀티TF 스캘핑 비활성(%s)이라 추가 매수 없이 누적 buy lot 익절로 전환합니다: %s",
+                    self.scalping_zone.bias,
+                    self.scalping_zone.reason,
+                )
+                self.phase = "HOLDING"
+                self._save()
+                self._place_take_profit()
+                return
             self._log_skip(
                 f"멀티TF 스캘핑 비활성({self.scalping_zone.bias}): {self.scalping_zone.reason}"
             )
             return
         decision = self.strategy.plan_buy(snapshot, self.exchange.quote_available())
         if decision.plan is None:
+            if self.position is not None:
+                logger.info(
+                    "추가 매수 조건이 없어 누적 buy lot 익절로 전환합니다. %s",
+                    decision.skip_reason or "매수 조건 아님",
+                )
+                self.phase = "HOLDING"
+                self._save()
+                self._place_take_profit()
+                return
             self._log_skip(decision.skip_reason or "매수 조건 아님")
             return
         plan = decision.plan
         depth = snapshot.bid_size * plan.price
         if depth < plan.notional:
             logger.warning(
-                "최우선 매수 잔량 약 %s %s 가 주문금액 %s 보다 작습니다. 지정가 매수는 대기하지만 시장가 손절은 호가를 잠식합니다.",
+                "최우선 매수 잔량 약 %s %s 가 주문금액 %s 보다 작습니다. 지정가 매수는 대기합니다.",
                 to_plain_str(depth),
                 self.cfg.quote,
                 to_plain_str(plan.notional),
@@ -297,8 +323,8 @@ class RoundTripBot:
     def _step_buy(self, snapshot: MarketSnapshot) -> None:
         order = self._load_order()
         if order is None:
-            if self.exchange.base_total() * snapshot.trade_price >= self.cfg.min_order_quote:
-                self._adopt_naked_base()
+            if self.position is not None:
+                self._after_buy_filled()
                 return
             logger.error("매수 주문을 찾지 못했습니다. 상태를 초기화합니다.")
             self._enter_flat()
@@ -306,22 +332,25 @@ class RoundTripBot:
         if not order.is_open:
             if order.executed_volume > 0:
                 self._on_buy_filled(order)
+            elif self.position is not None:
+                logger.warning("추가 매수가 체결 없이 취소되었습니다. 누적 buy lot 으로 홀딩합니다.")
+                self._after_buy_filled()
             else:
                 logger.warning("매수 주문이 체결 없이 취소되었습니다.")
                 self._enter_flat(cooldown=self.cfg.reject_cooldown_sec)
             return
         if (
             order.executed_volume == 0
+            and self.position is None
             and self.exchange.base_total() * snapshot.trade_price >= self.cfg.min_order_quote
         ):
-            logger.warning("매수 주문과 별도로 코인 잔고가 있어 매수를 취소하고 매도로 전환합니다.")
-            self._cancel_tracked()
-            self._adopt_naked_base()
-            return
+            logger.warning(
+                "매수 주문과 별도로 코인 잔고가 있습니다. 이번 buy lot 밖 보유로 보고 자동 매도하지 않습니다."
+            )
         if not self._buy_timed_out() and not self._dynamic_buy_moved(order, snapshot):
             return
         if order.executed_volume > 0:
-            logger.info("부분 체결된 매수를 취소하고 체결분만큼 매도합니다.")
+            logger.info("부분 체결된 매수를 취소하고 체결분을 누적합니다.")
             closed = self._cancel_tracked()
             self._on_buy_filled(closed or order)
             return
@@ -330,7 +359,10 @@ class RoundTripBot:
         if decision.plan is None:
             logger.info("재호가 조건이 사라져 미체결 매수를 취소합니다. %s", decision.skip_reason)
             self._cancel_tracked()
-            self._enter_flat()
+            if self.position is not None:
+                self._after_buy_filled()
+            else:
+                self._enter_flat()
             return
         plan = decision.plan
         if plan.price == order.price:
@@ -350,14 +382,21 @@ class RoundTripBot:
             self._on_buy_filled(replaced)
             return
         if not replaced.is_open:
-            self._enter_flat(cooldown=self.cfg.reject_cooldown_sec)
+            if self.position is not None:
+                self._after_buy_filled()
+            else:
+                self._enter_flat(cooldown=self.cfg.reject_cooldown_sec)
             return
         self.phase = "BUY_WAIT"
         self._track(replaced)
         logger.info("매수 재호가 | price=%s volume=%s", to_plain_str(plan.price), to_plain_str(replaced.volume))
 
     def _step_holding(self, snapshot: MarketSnapshot) -> None:
-        if self.position and self.strategy.should_stop(snapshot.trade_price, self.position.stop_price):
+        if (
+            self.cfg.stop_loss_enabled
+            and self.position
+            and self.strategy.should_stop(snapshot.trade_price, self.position.stop_price)
+        ):
             self._execute_stop(snapshot)
             return
         self._place_take_profit()
@@ -365,7 +404,7 @@ class RoundTripBot:
     def _step_sell(self, snapshot: MarketSnapshot) -> None:
         order = self._load_order()
         if order is None:
-            logger.warning("매도 주문이 보이지 않습니다. 잔고 기준으로 다시 맞춥니다.")
+            logger.warning("매도 주문이 보이지 않습니다. 이번 buy lot 기준으로 다시 맞춥니다.")
             self._adopt_naked_base()
             return
         if not order.is_open:
@@ -379,7 +418,11 @@ class RoundTripBot:
                 return
             self._finish_exit(snapshot, "지정가 매도")
             return
-        if self.position and self.strategy.should_stop(snapshot.trade_price, self.position.stop_price):
+        if (
+            self.cfg.stop_loss_enabled
+            and self.position
+            and self.strategy.should_stop(snapshot.trade_price, self.position.stop_price)
+        ):
             self._execute_stop(snapshot)
             return
         if order.price is None or self.position is None:
@@ -403,11 +446,15 @@ class RoundTripBot:
             self.order_placed_at = time.time()
             self._save()
             return
+        remaining = self._lot_remaining()
+        sell_volume = order.remaining_volume if order.remaining_volume > 0 else order.volume
+        if remaining > 0:
+            sell_volume = min(sell_volume, remaining)
         replaced = self.exchange.cancel_and_replace_limit(
             order.uuid,
             "ask",
             new_price,
-            order.remaining_volume if order.remaining_volume > 0 else order.volume,
+            sell_volume,
             self.cfg.post_only,
             self.cfg.market,
         )
@@ -426,7 +473,23 @@ class RoundTripBot:
         self.exchange.begin_step()
         return self.exchange.base_total() > 0
 
+    def _lot_remaining(self) -> Decimal:
+        if self.position is None:
+            return Decimal("0")
+        return max(Decimal("0"), self.position.volume - self.position.sold_volume)
+
+    def _stop_for_buy(self, buy_price: Decimal) -> Decimal:
+        if not self.cfg.stop_loss_enabled:
+            return Decimal("0")
+        return self.strategy.stop_price(buy_price)
+
+    def _quote_allows_more_buy(self) -> bool:
+        self.exchange.begin_step()
+        return self.exchange.quote_available() >= self.cfg.min_order_quote
+
     def _execute_stop(self, snapshot: MarketSnapshot) -> None:
+        if not self.cfg.stop_loss_enabled:
+            return
         if self.position is None:
             self._enter_flat()
             return
@@ -443,10 +506,20 @@ class RoundTripBot:
             self.order_uuid = None
         self._liquidate(snapshot, "손절")
 
-    def _liquidate(self, snapshot: MarketSnapshot, reason: str) -> None:
+    def _sellable_lot_volume(self, trade_price: Decimal) -> Decimal:
         self.exchange.begin_step()
-        volume = floor_to_precision(self.exchange.base_available(), self.cfg.volume_precision)
-        if volume <= 0 or volume * snapshot.trade_price < self.cfg.min_order_quote:
+        free = self.exchange.base_available()
+        remaining = self._lot_remaining()
+        volume = floor_to_precision(min(remaining, free), self.cfg.volume_precision)
+        if volume <= 0:
+            return Decimal("0")
+        if trade_price > 0 and volume * trade_price < self.cfg.min_order_quote:
+            return Decimal("0")
+        return volume
+
+    def _liquidate(self, snapshot: MarketSnapshot, reason: str) -> None:
+        volume = self._sellable_lot_volume(snapshot.trade_price)
+        if volume <= 0:
             self._log_pnl(reason)
             return
         try:
@@ -460,10 +533,9 @@ class RoundTripBot:
                     self._user_cancel = False
                 if order.executed_volume > 0 and not order.is_open:
                     self._account_sell(order)
-                self.exchange.begin_step()
-                volume = floor_to_precision(self.exchange.base_available(), self.cfg.volume_precision)
-                if volume > 0 and volume * snapshot.trade_price >= self.cfg.min_order_quote:
-                    order = self.exchange.sell_market(self.cfg.market, volume)
+                leftover = self._sellable_lot_volume(snapshot.trade_price)
+                if leftover > 0:
+                    order = self.exchange.sell_market(self.cfg.market, leftover)
                     order = self._wait_closed(order, 5)
                     self._account_sell(order)
             else:
@@ -482,17 +554,19 @@ class RoundTripBot:
         self._finish_exit(snapshot, reason)
 
     def _finish_exit(self, snapshot: MarketSnapshot, reason: str) -> None:
-        self.exchange.begin_step()
-        residual = self.exchange.base_total()
+        residual = self._lot_remaining()
         if residual * snapshot.trade_price >= self.cfg.min_order_quote:
             if self.position:
                 self.position.exit_attempts += 1
                 if self.position.exit_attempts >= 3:
-                    logger.error("잔여 수량 청산을 마치지 못했습니다. 중지합니다. residual=%s", to_plain_str(residual))
+                    logger.error(
+                        "이번 buy lot 잔여 청산을 마치지 못했습니다. 중지합니다. residual=%s",
+                        to_plain_str(residual),
+                    )
                     self.phase = "HALT"
                     self._save()
                     return
-            logger.warning("잔여 코인 %s 을 다시 청산합니다.", to_plain_str(residual))
+            logger.warning("이번 buy lot 잔여 %s 을 다시 청산합니다.", to_plain_str(residual))
             self.order_uuid = None
             self._liquidate(snapshot, reason)
             return
@@ -501,7 +575,10 @@ class RoundTripBot:
     def _on_buy_filled(self, order: Order) -> None:
         volume = order.executed_volume
         if volume <= 0:
-            self._enter_flat()
+            if self.position is not None:
+                self._after_buy_filled()
+            else:
+                self._enter_flat()
             return
         notional = order.funds
         if notional <= 0 and order.price is not None:
@@ -510,28 +587,56 @@ class RoundTripBot:
         if fee <= 0 and notional > 0:
             fee = notional * self.strategy.params.buy_fee_rate
             logger.info("매수 수수료 필드가 비어 설정값으로 추정합니다: %s", to_plain_str(fee))
-        buy_price = notional / volume
-        minimum = self.strategy.min_sell_price(buy_price)
-        self.position = Position(
-            cycle_id=uuid.uuid4().hex[:12],
-            buy_price=buy_price,
-            volume=volume,
-            buy_notional=notional,
-            buy_fee=fee,
-            stop_price=self.strategy.stop_price(buy_price),
-            min_sell_price=minimum,
-        )
+        if self.position is None:
+            buy_price = notional / volume
+            minimum = self.strategy.min_sell_price(buy_price)
+            self.position = Position(
+                cycle_id=uuid.uuid4().hex[:12],
+                buy_price=buy_price,
+                volume=volume,
+                buy_notional=notional,
+                buy_fee=fee,
+                stop_price=self._stop_for_buy(buy_price),
+                min_sell_price=minimum,
+            )
+            self._seen_sells.clear()
+        else:
+            total_volume = self.position.volume + volume
+            total_notional = self.position.buy_notional + notional
+            total_fee = self.position.buy_fee + fee
+            buy_price = total_notional / total_volume
+            self.position.volume = total_volume
+            self.position.buy_notional = total_notional
+            self.position.buy_fee = total_fee
+            self.position.buy_price = buy_price
+            self.position.stop_price = self._stop_for_buy(buy_price)
+            self.position.min_sell_price = self.strategy.min_sell_price(buy_price)
         self.order_uuid = None
-        self._seen_sells.clear()
         logger.info(
-            "매수 체결 | 가격 %s | 수량 %s | 금액 %s | 수수료 %s | 손절가 %s | 최소매도가 %s",
-            to_plain_str(buy_price),
+            "매수 체결 | 가격 %s | 수량 %s | 누적수량 %s | 금액 %s | 수수료 %s | 손절가 %s | 최소매도가 %s",
+            to_plain_str(self.position.buy_price),
             to_plain_str(volume),
-            to_plain_str(notional),
-            to_plain_str(fee),
+            to_plain_str(self.position.volume),
+            to_plain_str(self.position.buy_notional),
+            to_plain_str(self.position.buy_fee),
             to_plain_str(self.position.stop_price),
-            to_plain_str(minimum),
+            to_plain_str(self.position.min_sell_price),
         )
+        self._after_buy_filled()
+
+    def _after_buy_filled(self) -> None:
+        if self.position is None:
+            self._enter_flat()
+            return
+        if self._quote_allows_more_buy():
+            logger.info(
+                "잔여 USDT %s 가 남아 추가 매수로 전환을 이어갑니다.",
+                to_plain_str(self.exchange.quote_available()),
+            )
+            self.phase = "FLAT"
+            self.order_uuid = None
+            self._save()
+            return
         self.phase = "HOLDING"
         self._save()
         self._place_take_profit()
@@ -542,15 +647,19 @@ class RoundTripBot:
             return
         self.exchange.begin_step()
         free = self.exchange.base_available()
-        volume = floor_to_precision(min(self.position.volume, free), self.cfg.volume_precision)
+        remaining = self._lot_remaining()
+        volume = floor_to_precision(min(remaining, free), self.cfg.volume_precision)
         price = max(self.position.min_sell_price, self.strategy.min_sell_price(self.position.buy_price))
         if volume <= 0 or volume * price < self.cfg.min_order_quote:
-            if free * self._last_price >= self.cfg.min_order_quote:
+            if remaining > 0 and free * self._last_price >= self.cfg.min_order_quote:
                 self.phase = "HOLDING"
                 self._save()
                 logger.info("매도 가능 잔고 반영을 기다립니다.")
                 return
-            logger.warning("보유 수량이 최소 주문금액보다 작아 매도할 수 없습니다.")
+            if remaining <= 0:
+                self._log_pnl("지정가 매도")
+                return
+            logger.warning("이번 buy lot 수량이 최소 주문금액보다 작아 매도할 수 없습니다.")
             self.phase = "HALT"
             self._save()
             return
@@ -569,18 +678,22 @@ class RoundTripBot:
         self.phase = "SELL_WAIT"
         self._track(order)
         logger.info(
-            "매도 대기 | price=%s volume=%s | 매수가 %s 대비 최소 이익 가격",
+            "매도 대기 | price=%s volume=%s (buy lot) | 매수가 %s 대비 최소 이익 가격",
             to_plain_str(price),
             to_plain_str(volume),
             to_plain_str(self.position.buy_price),
         )
 
     def _adopt_naked_base(self) -> None:
+        """상태 파일에 기록된 이번 buy lot 만 이어받습니다. 외부/기타 BTC 는 자동 매도하지 않습니다."""
         self.exchange.begin_step()
         total = self.exchange.base_total()
         price = self._reference_price()
-        if total <= 0 or price <= 0 or total * price < self.cfg.min_order_quote:
-            self._enter_flat()
+        if self.position is not None and self._lot_remaining() > 0:
+            self.order_uuid = None
+            self.phase = "HOLDING"
+            self._save()
+            self._place_take_profit()
             return
         saved = self._read_state()
         saved_pos = (saved or {}).get("position") if saved else None
@@ -590,40 +703,32 @@ class RoundTripBot:
             self._save()
             return
         if saved_pos and saved_pos.get("buy_price"):
-            volume = self._decimal_field(saved_pos, "volume", str(total))
-            if volume <= 0:
-                volume = total
+            volume = self._decimal_field(saved_pos, "volume", "0")
+            sold = self._decimal_field(saved_pos, "sold_volume")
+            remaining = max(Decimal("0"), volume - sold)
+            if remaining <= 0:
+                self._enter_flat()
+                return
             self.position = self._position_from_saved(saved_pos, volume)
             if self.position is None:
                 logger.error("상태 파일의 매수 단가를 읽지 못했습니다. 자동 매도를 넣지 않습니다.")
                 self.phase = "HALT"
                 self._save()
                 return
-        else:
-            buy_price = self.exchange.base_avg_buy_price()
-            if buy_price <= 0:
-                logger.error("매수 단가를 알 수 없어 자동 매도를 넣지 않습니다. 잔고를 직접 확인하세요.")
-                self.phase = "HALT"
-                self._save()
-                return
-            notional = buy_price * total
-            fee = notional * self.strategy.params.buy_fee_rate
-            logger.warning("상태 파일이 없어 거래소 평단 %s 으로 매도 기준을 잡습니다. 손익은 추정치입니다.", to_plain_str(buy_price))
-            self.position = Position(
-                cycle_id=uuid.uuid4().hex[:12],
-                buy_price=buy_price,
-                volume=total,
-                buy_notional=notional,
-                buy_fee=fee,
-                stop_price=self.strategy.stop_price(buy_price),
-                min_sell_price=self.strategy.min_sell_price(buy_price),
-                estimated=True,
-                cost_known=True,
-            )
-        self.order_uuid = None
-        self.phase = "HOLDING"
+            self.order_uuid = None
+            self.phase = "HOLDING"
+            self._save()
+            self._place_take_profit()
+            return
+        if total <= 0 or price <= 0 or total * price < self.cfg.min_order_quote:
+            self._enter_flat()
+            return
+        logger.error(
+            "이번 사이클 buy lot 기록이 없어 잔고 %s 을 자동 매도하지 않습니다. 거래소에서 직접 확인하세요.",
+            to_plain_str(total),
+        )
+        self.phase = "HALT"
         self._save()
-        self._place_take_profit()
 
     def _reconcile(self) -> None:
         self.exchange.begin_step()
@@ -691,7 +796,7 @@ class RoundTripBot:
                     volume=volume,
                     buy_notional=notional,
                     buy_fee=notional * self.strategy.params.buy_fee_rate,
-                    stop_price=self.strategy.stop_price(buy_price),
+                    stop_price=self._stop_for_buy(buy_price),
                     min_sell_price=self.strategy.min_sell_price(buy_price),
                     estimated=True,
                     cost_known=True,
@@ -977,6 +1082,7 @@ class RoundTripBot:
                 entry_zone=self.cfg.entry_zone,
                 breakdown_buffer=self.cfg.breakdown_buffer,
                 stop_loss_rate=self.cfg.stop_loss_rate,
+                stop_loss_enabled=self.cfg.stop_loss_enabled,
                 daily_sma_period=self.cfg.daily_sma_period,
             )
         except Exception:
@@ -1003,6 +1109,9 @@ class RoundTripBot:
         self._warn_stop_width()
 
     def _warn_stop_width(self) -> None:
+        if not self.cfg.stop_loss_enabled:
+            logger.info("손절 비활성(STOP_LOSS_ENABLED=false). USDT→BTC 전환·홀딩 중 손절하지 않습니다.")
+            return
         stop = self.strategy.params.stop_loss_rate
         if self.strategy.levels is not None:
             width = self.strategy.levels.grid_rate
@@ -1193,13 +1302,13 @@ class RoundTripBot:
         if cost_known:
             try:
                 minimum = self.strategy.min_sell_price(buy_price)
-                stop = self.strategy.stop_price(buy_price)
+                stop = self._stop_for_buy(buy_price)
             except ValueError:
                 logger.exception("저장된 매수가로 손절가와 최소 매도가를 계산하지 못했습니다.")
                 return None
         else:
             minimum = self._decimal_field(saved_pos, "min_sell_price")
-            stop = self._decimal_field(saved_pos, "stop_price")
+            stop = Decimal("0") if not self.cfg.stop_loss_enabled else self._decimal_field(saved_pos, "stop_price")
         notional = self._decimal_field(saved_pos, "buy_notional")
         if notional <= 0:
             notional = buy_price * volume

@@ -990,6 +990,35 @@ class DryRunExchange:
             return self.buy_limit(market, price, volume, post_only)
         return self.sell_limit(market, price, volume, post_only)
 
+    def fill_buy_partial(self, order_uuid: str, volume: Decimal) -> Order:
+        """테스트용: 지정가 매수를 일부만 체결합니다."""
+        order = self._orders.get(order_uuid)
+        if order is None or not order.is_open or order.side != "bid" or order.price is None:
+            raise UpbitAPIError("부분 체결할 매수 주문이 없습니다.", retryable=False)
+        volume = min(volume, order.remaining_volume)
+        if volume <= 0:
+            return order
+        notional = order.price * volume
+        fee = notional * self.cfg.buy_fee_rate
+        spent = notional + fee
+        self._quote_locked -= spent
+        order.locked_funds -= spent
+        self._credit_base(volume, order.price)
+        order.executed_volume += volume
+        order.remaining_volume -= volume
+        order.paid_fee += fee
+        order.trades.append(
+            {"price": to_plain_str(order.price), "volume": to_plain_str(volume), "funds": to_plain_str(notional)}
+        )
+        if order.remaining_volume <= 0:
+            order.remaining_volume = Decimal("0")
+            order.locked_funds = Decimal("0")
+            order.state = "done"
+        self._tag(
+            f"지정가 매수 부분체결 price={to_plain_str(order.price)} volume={to_plain_str(volume)} fee={to_plain_str(fee)} uuid={order.uuid}"
+        )
+        return order
+
     def _fill_buy(self, order: Order) -> None:
         volume = order.remaining_volume
         if volume <= 0 or order.price is None:

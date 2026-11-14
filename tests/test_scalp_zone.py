@@ -55,6 +55,18 @@ class ScalpZoneTests(unittest.TestCase):
         self.assertLess(zone.zone_low, zone.zone_high)
         self.assertGreater(zone.target_rate, 0)
         self.assertGreater(zone.target_sell, zone.reference_buy)
+        self.assertEqual(zone.stop_price, Decimal("0"))
+        self.assertEqual(zone.stop_rate, Decimal("0"))
+        enabled = compute_scalping_zone(
+            minute,
+            daily,
+            market="USDT-BTC",
+            entry_zone=Decimal("0.40"),
+            stop_loss_enabled=True,
+            stop_loss_rate=Decimal("0.005"),
+        )
+        self.assertGreater(enabled.stop_price, Decimal("0"))
+        self.assertEqual(enabled.stop_rate, Decimal("0.005"))
 
     def test_avoid_on_daily_breakdown(self) -> None:
         daily = _series(150, start_ms=0, step_ms=86_400_000, base=Decimal("100"), swing=Decimal("1"))

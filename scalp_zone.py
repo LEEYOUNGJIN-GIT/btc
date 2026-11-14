@@ -2,7 +2,8 @@
 
 분봉: ATR·박스·그리드(봇 analyzer 와 동일)로 단기 매수 밴드/목표 간격을 잡습니다.
 일봉: 같은 지표 + SMA·박스 위치로 추세 필터(허용/중립/회피)를 겁니다.
-두 결과를 합쳐 zone_low~zone_high, target_rate, stop_rate, actionable 을 냅니다.
+두 결과를 합쳐 zone_low~zone_high, target_rate, actionable 을 냅니다.
+손절은 봇 기본값과 같이 비활성(stop_price=0)이며, stop_loss_enabled=true 일 때만 참고가를 채웁니다.
 """
 
 from __future__ import annotations
@@ -63,6 +64,7 @@ def compute_scalping_zone(
     entry_zone: Decimal = Decimal("0.40"),
     breakdown_buffer: Decimal = Decimal("0.002"),
     stop_loss_rate: Decimal = Decimal("0.005"),
+    stop_loss_enabled: bool = False,
     daily_sma_period: int = 20,
 ) -> ScalpingZone:
     """분봉·일봉 기술적 지표로 스캘핑 허용 구간을 만듭니다."""
@@ -134,7 +136,12 @@ def compute_scalping_zone(
     if ref_buy <= 0:
         ref_buy = align_price(minute.last_close, "floor")
     target_sell = grid_sell_price(ref_buy, target_rate, buy_fee_rate, sell_fee_rate)
-    stop = align_price(ref_buy * (Decimal("1") - stop_loss_rate), "floor")
+    if stop_loss_enabled:
+        stop_rate = stop_loss_rate
+        stop = align_price(ref_buy * (Decimal("1") - stop_loss_rate), "floor")
+    else:
+        stop_rate = Decimal("0")
+        stop = Decimal("0")
 
     blended = DynamicLevels(
         support=zone_low,
@@ -156,7 +163,7 @@ def compute_scalping_zone(
         zone_low=zone_low,
         zone_high=zone_high,
         target_rate=target_rate,
-        stop_rate=stop_loss_rate,
+        stop_rate=stop_rate,
         target_sell=target_sell,
         stop_price=stop,
         reference_buy=ref_buy,

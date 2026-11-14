@@ -9,7 +9,7 @@ from backfill import OhlcvBar
 from config import AppConfig
 from exchange_api import DryRunExchange, NullFeed, ScriptedMarket
 from main import Position, RoundTripBot
-from strategy import Strategy
+from strategy import Strategy, floor_to_precision
 
 
 def make_config(**overrides: object) -> AppConfig:
@@ -23,6 +23,7 @@ def make_config(**overrides: object) -> AppConfig:
         buy_fee_rate=Decimal("0.0005"),
         sell_fee_rate=Decimal("0.0005"),
         target_profit_rate=Decimal("0.0025"),
+        stop_loss_enabled=False,
         stop_loss_rate=Decimal("0.005"),
         stop_loss_order_type="market",
         dry_run_slippage_rate=Decimal("0.0005"),
@@ -98,9 +99,24 @@ class BotTests(unittest.TestCase):
         self.assertGreater(self.exchange.quote_available(), Decimal("1000"))
         self.assertEqual(self.bot.completed_cycles, 1)
 
-    def test_stop_loss_reduces_quote_and_cools_down(self) -> None:
+    def test_stop_loss_disabled_keeps_sell_wait(self) -> None:
         self._enter_sell_wait()
         assert self.bot.position is not None
+        self.assertEqual(self.bot.position.stop_price, Decimal("0"))
+        self.market.trade_price = Decimal("1")
+        self.market.best_bid = Decimal("1")
+        self.market.best_ask = Decimal("1.01")
+        self.bot.step()
+        self.assertEqual(self.bot.phase, "SELL_WAIT")
+        self.assertGreater(self.exchange.base_total(), Decimal("0"))
+
+    def test_stop_loss_enabled_reduces_quote_and_cools_down(self) -> None:
+        self.cfg = make_config(stop_loss_enabled=True)
+        self.exchange = DryRunExchange(self.cfg, self.market)
+        self.bot = RoundTripBot(self.cfg, self.exchange, Strategy(self.cfg.to_strategy_params()), NullFeed())
+        self._enter_sell_wait()
+        assert self.bot.position is not None
+        self.assertGreater(self.bot.position.stop_price, Decimal("0"))
         self.market.trade_price = self.bot.position.stop_price
         self.market.best_bid = self.bot.position.stop_price
         self.market.best_ask = self.bot.position.stop_price + Decimal("0.01")
@@ -129,7 +145,7 @@ class BotTests(unittest.TestCase):
         self.assertGreater(replaced.price, first_order.price)
         self.assertEqual(len(self.exchange.list_open_orders(self.cfg.market)), 1)
 
-    def test_reconcile_open_buy_and_naked_base(self) -> None:
+    def test_reconcile_open_buy_and_suppresses_naked_base(self) -> None:
         order = self.exchange.buy_limit(self.cfg.market, Decimal("99"), Decimal("0.2"), False)
         self.bot._reconcile()
         self.assertEqual(self.bot.phase, "BUY_WAIT")
@@ -143,10 +159,10 @@ class BotTests(unittest.TestCase):
         self.assertFalse(filled.is_open)
         resumed = RoundTripBot(self.cfg, fresh, Strategy(self.cfg.to_strategy_params()), NullFeed())
         resumed._reconcile()
-        self.assertEqual(resumed.phase, "SELL_WAIT")
-        sell = fresh.get_order(resumed.order_uuid or "")
-        assert sell is not None and sell.price is not None
-        self.assertGreaterEqual(sell.price, resumed.strategy.min_sell_price(Decimal("100")))
+        self.assertEqual(resumed.phase, "HALT")
+        self.assertIsNone(resumed.order_uuid)
+        self.assertEqual(fresh.base_total(), Decimal("0.1"))
+        self.assertEqual(fresh.list_open_orders(self.cfg.market), [])
 
     def test_live_mode_requires_explicit_confirm(self) -> None:
         with self.assertRaises(ValueError):
@@ -306,6 +322,62 @@ class BotTests(unittest.TestCase):
             blocked.step()
             self.assertEqual(blocked.phase, "FLAT")
             self.assertEqual(book.list_open_orders(quiet.market), [])
+
+    def test_partial_buy_accumulates_then_take_profit_lot_only(self) -> None:
+        self.bot.step()
+        self.assertEqual(self.bot.phase, "BUY_WAIT")
+        order = self.exchange.get_order(self.bot.order_uuid or "")
+        assert order is not None and order.price is not None
+        partial = floor_to_precision(order.volume / Decimal("2"), self.cfg.volume_precision)
+        self.assertGreater(partial, Decimal("0"))
+        self.exchange.fill_buy_partial(order.uuid, partial)
+        self.bot.order_placed_at = 0
+        self.bot.step()
+        self.assertIsNotNone(self.bot.position)
+        assert self.bot.position is not None
+        self.assertEqual(self.bot.position.volume, partial)
+        self.assertEqual(self.bot.position.stop_price, Decimal("0"))
+        if self.bot.phase == "BUY_WAIT":
+            self.market.trade_price = self.exchange.get_order(self.bot.order_uuid or "").price or order.price
+            self.market.best_bid = self.market.trade_price
+            self.market.best_ask = self.market.trade_price + Decimal("0.01")
+            self.bot.step()
+        if self.bot.phase == "FLAT":
+            self.bot.step()
+            if self.bot.phase == "BUY_WAIT":
+                follow = self.exchange.get_order(self.bot.order_uuid or "")
+                assert follow is not None and follow.price is not None
+                self.market.trade_price = follow.price
+                self.market.best_bid = follow.price
+                self.market.best_ask = follow.price + Decimal("0.01")
+                self.bot.step()
+        self.assertIn(self.bot.phase, {"HOLDING", "SELL_WAIT"})
+        assert self.bot.position is not None
+        lot = self.bot.position.volume
+        if self.bot.phase == "HOLDING":
+            self.bot.step()
+        self.assertEqual(self.bot.phase, "SELL_WAIT")
+        sell = self.exchange.get_order(self.bot.order_uuid or "")
+        assert sell is not None
+        self.assertEqual(sell.volume, lot)
+
+    def test_take_profit_volume_ignores_foreign_base(self) -> None:
+        self._enter_sell_wait()
+        assert self.bot.position is not None
+        lot = self.bot.position.volume
+        self.exchange._base_available += Decimal("0.05")
+        self.bot.order_placed_at = 0
+        open_sell = self.exchange.get_order(self.bot.order_uuid or "")
+        assert open_sell is not None
+        self.exchange.cancel(open_sell.uuid)
+        self.bot.order_uuid = None
+        self.bot.phase = "HOLDING"
+        self.bot.step()
+        self.assertEqual(self.bot.phase, "SELL_WAIT")
+        sell = self.exchange.get_order(self.bot.order_uuid or "")
+        assert sell is not None
+        self.assertEqual(sell.volume, lot)
+        self.assertEqual(self.exchange.base_available(), Decimal("0.05"))
 
     def test_stale_backfill_keeps_fixed_prices(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
