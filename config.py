@@ -52,6 +52,7 @@ class AppConfig:
     buy_fee_rate: Decimal
     sell_fee_rate: Decimal
     target_profit_rate: Decimal
+    stop_loss_enabled: bool
     stop_loss_rate: Decimal
     stop_loss_order_type: str
     dry_run_slippage_rate: Decimal
@@ -224,6 +225,7 @@ def load_config() -> AppConfig:
         buy_fee_rate=_decimal("BUY_FEE_RATE", "0.0005"),
         sell_fee_rate=_decimal("SELL_FEE_RATE", "0.0005"),
         target_profit_rate=_decimal("TARGET_PROFIT_RATE", "0.0025"),
+        stop_loss_enabled=_bool("STOP_LOSS_ENABLED", False),
         stop_loss_rate=_decimal("STOP_LOSS_RATE", "0.005"),
         stop_loss_order_type=_text("STOP_LOSS_ORDER_TYPE", "market").lower(),
         dry_run_slippage_rate=_decimal("DRY_RUN_SLIPPAGE_RATE", "0.0005"),
