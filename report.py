@@ -113,10 +113,11 @@ def _zone_dict(zone: Any) -> dict[str, Any]:
         "zone_low": _dec(zone.zone_low),
         "zone_high": _dec(zone.zone_high),
         "target_rate_pct": _pct(zone.target_rate),
-        "stop_rate_pct": _pct(zone.stop_rate),
+        "stop_loss_enabled": zone.stop_rate > 0,
+        "stop_rate_pct": _pct(zone.stop_rate) if zone.stop_rate > 0 else "disabled",
         "reference_buy": _dec(zone.reference_buy),
         "target_sell": _dec(zone.target_sell),
-        "stop_price": _dec(zone.stop_price),
+        "stop_price": _dec(zone.stop_price) if zone.stop_price > 0 else "disabled",
         "daily_position_pct": _pct(zone.daily_position),
         "daily_sma": _dec(zone.daily_sma),
         "minute_levels": _levels_dict(zone.minute),
@@ -138,6 +139,7 @@ def build_report(
     entry_zone: Decimal = Decimal("0.40"),
     breakdown_buffer: Decimal = Decimal("0.002"),
     stop_loss_rate: Decimal = Decimal("0.005"),
+    stop_loss_enabled: bool = False,
     daily_sma_period: int = 20,
 ) -> dict[str, Any]:
     report: dict[str, Any] = {
@@ -214,6 +216,7 @@ def build_report(
                 entry_zone=entry_zone,
                 breakdown_buffer=breakdown_buffer,
                 stop_loss_rate=stop_loss_rate,
+                stop_loss_enabled=stop_loss_enabled,
                 daily_sma_period=daily_sma_period,
             )
             payload = _zone_dict(zone)
@@ -322,6 +325,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--entry-zone", default="0.40")
     parser.add_argument("--breakdown-buffer", default="0.002")
     parser.add_argument("--stop-loss", default="0.005")
+    parser.add_argument(
+        "--stop-loss-enabled",
+        action="store_true",
+        help="손절 참고가를 리포트에 포함합니다. 기본은 비활성(disabled).",
+    )
     parser.add_argument("--daily-sma-period", type=int, default=20)
     return parser
 
@@ -341,6 +349,7 @@ def main(argv: list[str] | None = None) -> int:
         entry_zone=Decimal(args.entry_zone),
         breakdown_buffer=Decimal(args.breakdown_buffer),
         stop_loss_rate=Decimal(args.stop_loss),
+        stop_loss_enabled=bool(args.stop_loss_enabled),
         daily_sma_period=args.daily_sma_period,
     )
     json_path = Path(args.json_out)
